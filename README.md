@@ -27,7 +27,7 @@ piece already exists.
 | 5 | Token-aware rate limiter | ✅ Done |
 | 6 | Exact-match cache | ✅ Done |
 | 7 | Semantic cache | ✅ Done |
-| 8 | Streaming (SSE) | ⏳ Planned |
+| 8 | Streaming (SSE) | ✅ Done |
 | 9 | Ledger, metrics, dashboards | ⏳ Planned |
 | 10 | Load tests and benchmarks | ⏳ Planned |
 | 11 | Publish polish | ⏳ Planned |
@@ -902,6 +902,13 @@ README can do.
     `make download-embedding-model` for local runs — there is no first-run network fetch at
     startup the way the tokenizer has. If they're missing, the gateway logs a warning and
     runs with Tier-2 disabled rather than failing to start.
+16. **`X-Gateway-Attempts` is not set on a streaming response.** The header commits at the
+    first byte flushed, before the winning attempt is even known to have succeeded. See
+    `docs/adr/0013`.
+17. **A streaming cache hit is served as one fast burst (content, then finish, then
+    `[DONE]`), not paced like a live generation.** There's nothing left to wait for once the
+    full answer is already in hand, so a client watching timing can tell a cache hit from a
+    real completion. See `docs/adr/0013`.
 
 ## Roadmap
 

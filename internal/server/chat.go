@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/danger-baba/llm-inference-gateway/internal/auth"
 	"github.com/danger-baba/llm-inference-gateway/internal/cache/exact"
 	"github.com/danger-baba/llm-inference-gateway/internal/cache/semantic"
 	"github.com/danger-baba/llm-inference-gateway/internal/providers"
@@ -25,6 +26,11 @@ import (
 // them respectively.
 type tokenCounter interface {
 	CountMessages(messages []providers.Message) int
+	// CountText counts one fragment on its own, with no message-framing
+	// overhead -- what a streaming completion needs, since it arrives as
+	// a sequence of content fragments, not one message. See
+	// docs/adr/0013.
+	CountText(text string) int
 }
 
 type rateLimiter interface {
@@ -64,8 +70,6 @@ type chatDeps struct {
 	semanticCache semanticCache // nil under the same conditions as embedder
 }
 
-const streamNotYetSupportedMsg = "streaming is not supported yet (lands in Phase 8); send stream:false or omit it"
-
 func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req providers.CanonicalRequest
@@ -79,10 +83,6 @@ func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 		}
 		if len(req.Messages) == 0 {
 			writeJSONError(w, r, http.StatusBadRequest, "messages must not be empty")
-			return
-		}
-		if req.Stream {
-			writeJSONError(w, r, http.StatusNotImplemented, streamNotYetSupportedMsg)
 			return
 		}
 
@@ -101,11 +101,12 @@ func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 			return
 		}
 
+		promptTokens := deps.counter.CountMessages(req.Messages)
 		estimatedCompletion := deps.estimateCompletionTokens
 		if req.MaxTokens != nil {
 			estimatedCompletion = int64(*req.MaxTokens)
 		}
-		cost := int64(deps.counter.CountMessages(req.Messages)) + estimatedCompletion
+		cost := int64(promptTokens) + estimatedCompletion
 
 		keyCapacity := deps.defaultTPM
 		if identity.KeyTPMLimit != nil {
@@ -126,46 +127,20 @@ func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 			return
 		}
 
-		cacheEligible := exact.Eligible(&req, deps.cacheNonzeroTemperature)
-
-		// Tier-1 cache: consulted only after a successful reservation, per
-		// the request lifecycle. A hit releases that reservation entirely,
-		// since no provider call is about to happen.
-		var exactCacheKey string
-		if deps.cache != nil && cacheEligible {
-			if canon, err := exact.Canonicalize(&req); err == nil {
-				exactCacheKey = exact.Key(identity.OrgID.String(), canon)
-				if cached, hit, err := deps.cache.Get(r.Context(), exactCacheKey); err == nil && hit {
-					_ = deps.limiter.Adjust(r.Context(), scopes, cost)
-					writeCachedResponse(w, "exact", cached)
-					return
-				}
-			}
+		if req.Stream {
+			handleStreamingChatCompletion(w, r, deps, &req, identity, tiers, cost, scopes, promptTokens)
+			return
 		}
 
-		// Tier-2 cache: consulted only on a Tier-1 miss. A vector hit is
-		// rejected unless the non-semantic parameters (model, tools,
-		// response_format) also match exactly — similarity alone is
-		// insufficient (README, Tier-2 cache).
-		var semanticQuery semantic.Query
-		semanticEligible := deps.embedder != nil && deps.semanticCache != nil && cacheEligible
-		if semanticEligible {
-			toolsCanon, _ := exact.CanonicalizeJSON(req.Tools)
-			formatCanon, _ := exact.CanonicalizeJSON(req.ResponseFormat)
-			if vector, err := deps.embedder.Embed(concatUserTurns(req.Messages)); err == nil {
-				semanticQuery = semantic.Query{
-					TenantID: identity.OrgID.String(), Model: req.Model,
-					ToolsCanonical: string(toolsCanon), ResponseFormatCanonical: string(formatCanon),
-					Vector: vector,
-				}
-				if cached, _, hit := deps.semanticCache.Get(semanticQuery); hit {
-					_ = deps.limiter.Adjust(r.Context(), scopes, cost)
-					writeCachedResponse(w, "semantic", cached)
-					return
-				}
-			} else {
-				semanticEligible = false // embedding this request failed; don't try to Set() below either
-			}
+		// Cache lookups happen regardless of the stream flag -- it
+		// deliberately doesn't participate in the cache key (README,
+		// Tier-1 cache) -- so a non-streaming request can be served from
+		// an entry a streaming request populated, and vice versa.
+		cached, tier, lookup := checkCaches(r.Context(), deps, &req, identity)
+		if cached != nil {
+			_ = deps.limiter.Adjust(r.Context(), scopes, cost)
+			writeCachedResponse(w, tier, cached)
+			return
 		}
 
 		result, err := deps.engine.Execute(r.Context(), tiers, &req)
@@ -190,14 +165,73 @@ func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 		// the wire, and never affects it: caching a completed response
 		// and reconciling its reservation are both settle-asynchronously
 		// concerns, not response-path ones.
-		if exactCacheKey != "" && deps.cache != nil {
-			_ = deps.cache.Set(r.Context(), exactCacheKey, result.Response)
-		}
-		if semanticEligible {
-			deps.semanticCache.Set(semanticQuery, result.Response)
-		}
+		storeInCaches(r.Context(), deps, lookup, result.Response)
 		actual := int64(result.Response.Usage.PromptTokens + result.Response.Usage.CompletionTokens)
 		_ = deps.limiter.Adjust(r.Context(), scopes, cost-actual)
+	}
+}
+
+// cacheLookup carries whatever checkCaches learned about a request's
+// cache eligibility forward to storeInCaches, so a fresh completion
+// (streamed or not) can populate the same tiers a lookup just missed.
+type cacheLookup struct {
+	exactCacheKey    string
+	semanticQuery    semantic.Query
+	semanticEligible bool
+}
+
+// checkCaches consults Tier-1, then Tier-2 on a Tier-1 miss, exactly as
+// the request lifecycle describes. It returns a hit's response and which
+// tier served it ("exact" or "semantic"), or (nil, "", ...) on a miss --
+// in which case lookup carries what a caller needs to populate the cache
+// once it has a real response to store.
+func checkCaches(ctx context.Context, deps chatDeps, req *providers.CanonicalRequest, identity auth.Identity) (*providers.CanonicalResponse, string, cacheLookup) {
+	var lookup cacheLookup
+	cacheEligible := exact.Eligible(req, deps.cacheNonzeroTemperature)
+
+	if deps.cache != nil && cacheEligible {
+		if canon, err := exact.Canonicalize(req); err == nil {
+			lookup.exactCacheKey = exact.Key(identity.OrgID.String(), canon)
+			if cached, hit, err := deps.cache.Get(ctx, lookup.exactCacheKey); err == nil && hit {
+				return cached, "exact", lookup
+			}
+		}
+	}
+
+	// A vector hit is rejected unless the non-semantic parameters (model,
+	// tools, response_format) also match exactly -- similarity alone is
+	// insufficient (README, Tier-2 cache).
+	lookup.semanticEligible = deps.embedder != nil && deps.semanticCache != nil && cacheEligible
+	if lookup.semanticEligible {
+		toolsCanon, _ := exact.CanonicalizeJSON(req.Tools)
+		formatCanon, _ := exact.CanonicalizeJSON(req.ResponseFormat)
+		if vector, err := deps.embedder.Embed(concatUserTurns(req.Messages)); err == nil {
+			lookup.semanticQuery = semantic.Query{
+				TenantID: identity.OrgID.String(), Model: req.Model,
+				ToolsCanonical: string(toolsCanon), ResponseFormatCanonical: string(formatCanon),
+				Vector: vector,
+			}
+			if cached, _, hit := deps.semanticCache.Get(lookup.semanticQuery); hit {
+				return cached, "semantic", lookup
+			}
+		} else {
+			lookup.semanticEligible = false // embedding this request failed; don't try to Set() below either
+		}
+	}
+
+	return nil, "", lookup
+}
+
+// storeInCaches populates whichever tiers checkCaches found this request
+// eligible for. Only called once resp is a genuinely complete response --
+// never for a partial stream (README, Tier-2 cache: "never cache a
+// partial stream").
+func storeInCaches(ctx context.Context, deps chatDeps, lookup cacheLookup, resp *providers.CanonicalResponse) {
+	if lookup.exactCacheKey != "" && deps.cache != nil {
+		_ = deps.cache.Set(ctx, lookup.exactCacheKey, resp)
+	}
+	if lookup.semanticEligible {
+		deps.semanticCache.Set(lookup.semanticQuery, resp)
 	}
 }
 

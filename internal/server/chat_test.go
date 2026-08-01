@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,6 +38,11 @@ func lenientBreakerConfig() breaker.Config {
 type fakeTokenCounter struct{ n int }
 
 func (f fakeTokenCounter) CountMessages(_ []providers.Message) int { return f.n }
+
+// CountText counts words rather than returning a fixed number: streaming
+// tests need completion-token accounting to actually move as content
+// arrives, not stay pinned at a constant.
+func (f fakeTokenCounter) CountText(text string) int { return len(strings.Fields(text)) }
 
 type fakeRateLimiter struct {
 	allow         bool
@@ -236,7 +242,6 @@ func TestHandleChatCompletions_ValidationErrors(t *testing.T) {
 		{"missing model", `{"messages":[{"role":"user","content":"hi"}]}`, http.StatusBadRequest},
 		{"empty messages", `{"model":"fast","messages":[]}`, http.StatusBadRequest},
 		{"unknown model", `{"model":"nope","messages":[{"role":"user","content":"hi"}]}`, http.StatusBadRequest},
-		{"streaming not yet supported", `{"model":"fast","stream":true,"messages":[{"role":"user","content":"hi"}]}`, http.StatusNotImplemented},
 		{"malformed json", `{not json`, http.StatusBadRequest},
 	}
 	for _, tt := range tests {
@@ -406,6 +411,230 @@ func TestHandleChatCompletions_SemanticCache_NotConsultedWhenEmbeddingFails(t *t
 	}
 	if semCache.setCalls != 0 {
 		t.Errorf("Set called %d times, want 0 (embedding failed for this request, don't cache under a bad/no vector)", semCache.setCalls)
+	}
+}
+
+type sseEvent struct {
+	event string
+	data  string
+}
+
+func parseSSE(t *testing.T, body string) []sseEvent {
+	t.Helper()
+	var events []sseEvent
+	for _, block := range strings.Split(strings.TrimRight(body, "\n"), "\n\n") {
+		if block == "" {
+			continue
+		}
+		var ev sseEvent
+		for _, line := range strings.Split(block, "\n") {
+			switch {
+			case strings.HasPrefix(line, "event: "):
+				ev.event = strings.TrimPrefix(line, "event: ")
+			case strings.HasPrefix(line, "data: "):
+				ev.data = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		events = append(events, ev)
+	}
+	return events
+}
+
+func TestHandleChatCompletions_Streaming_Success(t *testing.T) {
+	p := mock.New("mock-provider", time.Millisecond, 0, 0)
+	deps := testDepsWithProvider(t, "mock-provider", p)
+
+	rec := doChatRequest(t, deps, `{"model":"fast","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+
+	if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want %q; body = %s", got, "text/event-stream", rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("Cache-Control = %q, want %q", got, "no-cache")
+	}
+	if got := rec.Header().Get("X-Accel-Buffering"); got != "no" {
+		t.Errorf("X-Accel-Buffering = %q, want %q", got, "no")
+	}
+	if got := rec.Header().Get("X-Gateway-Provider"); got != "mock-provider" {
+		t.Errorf("X-Gateway-Provider = %q, want %q", got, "mock-provider")
+	}
+
+	events := parseSSE(t, rec.Body.String())
+	if len(events) < 2 {
+		t.Fatalf("got %d SSE events, want at least 2 (content + [DONE]); body = %s", len(events), rec.Body.String())
+	}
+	last := events[len(events)-1]
+	if last.data != "[DONE]" {
+		t.Errorf("final event data = %q, want %q", last.data, "[DONE]")
+	}
+
+	var assembled strings.Builder
+	sawFinish := false
+	for _, ev := range events[:len(events)-1] { // every event except the final [DONE]
+		var chunk chatCompletionChunk
+		if err := json.Unmarshal([]byte(ev.data), &chunk); err != nil {
+			t.Fatalf("decode chunk %q: %v", ev.data, err)
+		}
+		if len(chunk.Choices) != 1 {
+			t.Fatalf("chunk.Choices = %+v, want exactly 1", chunk.Choices)
+		}
+		assembled.WriteString(chunk.Choices[0].Delta.Content)
+		if chunk.Choices[0].FinishReason != nil {
+			sawFinish = true
+			if *chunk.Choices[0].FinishReason != "stop" {
+				t.Errorf("FinishReason = %q, want %q", *chunk.Choices[0].FinishReason, "stop")
+			}
+		}
+	}
+	if !sawFinish {
+		t.Error("no chunk carried a non-nil finish_reason before [DONE]")
+	}
+	if got := assembled.String(); got != "mock response to: hi" {
+		t.Errorf("assembled content = %q, want %q", got, "mock response to: hi")
+	}
+
+	if p.CallCount() != 1 {
+		t.Errorf("CallCount() = %d, want 1", p.CallCount())
+	}
+	limiter := deps.limiter.(*fakeRateLimiter)
+	if limiter.adjustCalls != 1 {
+		t.Errorf("Adjust called %d times, want 1", limiter.adjustCalls)
+	}
+	// mock's own final Delta.Usage (PromptTokens=len("hi")=2,
+	// CompletionTokens=4 words) is what should have been reconciled,
+	// not the CountText-based estimate, since the provider did send one.
+	wantActual := int64(2 + 4)
+	wantCost := int64(10) + 512 // fakeTokenCounter{n:10} + estimateCompletionTokens
+	if limiter.lastDelta != wantCost-wantActual {
+		t.Errorf("last Adjust delta = %d, want %d", limiter.lastDelta, wantCost-wantActual)
+	}
+}
+
+func TestHandleChatCompletions_Streaming_PreFlushFailureFallsOverAndStillStreams(t *testing.T) {
+	primary := mock.New("primary", 0, 1, 429) // fails before sending any delta
+	secondary := mock.New("secondary", 0, 0, 0)
+
+	reg := breaker.NewRegistry(lenientBreakerConfig())
+	provs := map[string]providers.Provider{"primary": primary, "secondary": secondary}
+	timeouts := map[string]time.Duration{"primary": time.Second, "secondary": time.Second}
+	engine := retry.New(reg, provs, timeouts, retry.Config{MaxAttemptsPerProvider: 2, BaseBackoff: time.Millisecond, MaxBackoff: 5 * time.Millisecond})
+
+	rcfg := &config.Config{
+		Providers: []config.ProviderConfig{{Name: "primary", Priority: 0, Weight: 1}, {Name: "secondary", Priority: 1, Weight: 1}},
+		ModelAliases: map[string]map[string]string{
+			"fast": {"primary": "mock-model-v1", "secondary": "mock-model-v1"},
+		},
+	}
+	deps := chatDeps{
+		router: router.New(rcfg), engine: engine,
+		counter: fakeTokenCounter{n: 10}, limiter: alwaysAllowLimiter(),
+		defaultTPM: 100000, estimateCompletionTokens: 512,
+	}
+
+	rec := doChatRequest(t, deps, `{"model":"fast","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+
+	if got := rec.Header().Get("X-Gateway-Provider"); got != "secondary" {
+		t.Fatalf("X-Gateway-Provider = %q, want %q; body = %s", got, "secondary", rec.Body.String())
+	}
+	events := parseSSE(t, rec.Body.String())
+	if len(events) < 2 || events[len(events)-1].data != "[DONE]" {
+		t.Fatalf("stream did not complete normally; body = %s", rec.Body.String())
+	}
+	if secondary.CallCount() != 1 {
+		t.Errorf("secondary.CallCount() = %d, want 1", secondary.CallCount())
+	}
+}
+
+func TestHandleChatCompletions_Streaming_MidStreamFailureTerminatesWithErrorEvent(t *testing.T) {
+	primary := mock.New("primary", 0, 0, 0)
+	primary.FailMidStream(2, 500)
+	deps := testDepsWithProvider(t, "primary", primary)
+
+	rec := doChatRequest(t, deps, `{"model":"fast","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+
+	if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want %q (headers must already have committed once content flushed); body = %s", got, "text/event-stream", rec.Body.String())
+	}
+
+	events := parseSSE(t, rec.Body.String())
+	if len(events) == 0 {
+		t.Fatal("no SSE events at all")
+	}
+	last := events[len(events)-1]
+	if last.event != "error" {
+		t.Fatalf("final event = %q, want an %q event, not a silently truncated-looking-complete stream; body = %s", last.event, "error", rec.Body.String())
+	}
+	for _, ev := range events {
+		if ev.data == "[DONE]" {
+			t.Error("stream contains [DONE] despite a mid-stream failure -- must not look complete")
+		}
+	}
+
+	if primary.CallCount() != 1 {
+		t.Errorf("primary.CallCount() = %d, want 1 (no retry once content was flushed)", primary.CallCount())
+	}
+
+	limiter := deps.limiter.(*fakeRateLimiter)
+	if limiter.adjustCalls != 1 {
+		t.Fatalf("Adjust called %d times, want 1", limiter.adjustCalls)
+	}
+	// 2 deltas flushed ("mock ", "response "): CountText("mock ")=1 +
+	// CountText("response ")=1 = 2 completion tokens actually generated.
+	wantActual := int64(10) + 2 // fakeTokenCounter{n:10} prompt tokens + 2 completion tokens counted on the way past
+	wantCost := int64(10) + 512
+	if limiter.lastDelta != wantCost-wantActual {
+		t.Errorf("last Adjust delta = %d, want %d (charge for partial generation, refund the rest of the estimate)", limiter.lastDelta, wantCost-wantActual)
+	}
+}
+
+func TestHandleChatCompletions_Streaming_TotalFailureBeforeFlush_ReturnsNormalErrorResponse(t *testing.T) {
+	// Terminal-classified and fails before sending any delta: nothing is
+	// ever flushed, so this must look exactly like a non-streaming error
+	// -- plain JSON, correct status code -- not an SSE response.
+	deps := testDepsWithProvider(t, "flaky", mock.New("flaky", time.Millisecond, 1, 422))
+
+	rec := doChatRequest(t, deps, `{"model":"fast","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("status = %d, want %d; body = %s", rec.Code, http.StatusUnprocessableEntity, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want %q (nothing was ever flushed)", got, "application/json")
+	}
+}
+
+func TestHandleChatCompletions_Streaming_CacheHitServesSynthesizedSSE(t *testing.T) {
+	p := mock.New("mock-provider", time.Millisecond, 0, 0)
+	deps := testDepsWithProvider(t, "mock-provider", p)
+	deps.cache = newFakeExactCache()
+
+	body := `{"model":"fast","temperature":0,"messages":[{"role":"user","content":"hi"}]}`
+	streamBody := `{"model":"fast","temperature":0,"stream":true,"messages":[{"role":"user","content":"hi"}]}`
+
+	// First, a non-streaming request populates the cache (the key
+	// excludes `stream`, so a later streaming request can hit it).
+	first := doChatRequest(t, deps, body)
+	if first.Code != http.StatusOK {
+		t.Fatalf("priming request status = %d, want 200; body = %s", first.Code, first.Body.String())
+	}
+	if p.CallCount() != 1 {
+		t.Fatalf("CallCount() after priming request = %d, want 1", p.CallCount())
+	}
+
+	rec := doChatRequest(t, deps, streamBody)
+	if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want %q; body = %s", got, "text/event-stream", rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Gateway-Cache"); got != "exact" {
+		t.Errorf("X-Gateway-Cache = %q, want %q", got, "exact")
+	}
+	if p.CallCount() != 1 {
+		t.Errorf("CallCount() after cached streaming request = %d, want still 1", p.CallCount())
+	}
+
+	events := parseSSE(t, rec.Body.String())
+	if len(events) < 2 || events[len(events)-1].data != "[DONE]" {
+		t.Fatalf("cached stream did not terminate with [DONE]; body = %s", rec.Body.String())
 	}
 }
 

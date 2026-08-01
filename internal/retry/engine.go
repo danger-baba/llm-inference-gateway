@@ -171,6 +171,183 @@ func (e *Engine) tryCandidate(ctx context.Context, c router.Candidate, req *prov
 	return nil, lastStatus, lastErr
 }
 
+// StreamResult mirrors Result for a completed streaming call: there is no
+// final Response, since the content already went out incrementally, but
+// Usage carries whatever the winning provider's own final Delta reported
+// (nil if it never sent one — see providers.Delta's doc comment).
+type StreamResult struct {
+	Provider string
+	Attempts []Attempt
+	Usage    *providers.Usage
+}
+
+// StreamError is Error's streaming counterpart. Flushed records whether
+// any content ever reached onDelta successfully before Err occurred — the
+// caller needs this to know whether the client already has partial
+// content in hand (and must be told the stream ended in error) or whether
+// nothing was ever sent (and a normal error response is still possible).
+type StreamError struct {
+	Err      error
+	Attempts []Attempt
+	Flushed  bool
+}
+
+func (e *StreamError) Error() string { return e.Err.Error() }
+func (e *StreamError) Unwrap() error { return e.Err }
+
+// ExecuteStream walks tiers exactly as Execute does, but for a streaming
+// completion: each provider Delta is handed to onDelta as soon as it
+// arrives rather than assembled into one response. Per the README, this
+// changes the failover contract the moment onDelta first succeeds with
+// real content: before that point a failure behaves exactly like Execute
+// (reselect within the tier, fall over to the next tier, or abort on a
+// Terminal classification); after that point, ExecuteStream will not try
+// a second provider under any circumstances, because splicing two
+// providers' output into one response would be silently wrong, not
+// merely imperfect. It instead returns immediately with Flushed: true so
+// the caller can end the stream with an explicit error event.
+func (e *Engine) ExecuteStream(ctx context.Context, tiers []router.Tier, req *providers.CanonicalRequest, onDelta func(providerName string, d providers.Delta) error) (*StreamResult, error) {
+	var attempts []Attempt
+	var lastErr error = ErrNoHealthyProvider
+
+	for _, tier := range tiers {
+		tried := make(map[string]bool)
+		for {
+			candidate, ok := e.pickFromTier(tier, tried)
+			if !ok {
+				break
+			}
+			tried[candidate.ProviderName] = true
+
+			usage, flushed, status, err := e.tryCandidateStream(ctx, candidate, req, onDelta, &attempts)
+			if err == nil {
+				return &StreamResult{Provider: candidate.ProviderName, Attempts: attempts, Usage: usage}, nil
+			}
+			if errors.Is(err, errBreakerRejected) {
+				continue
+			}
+			if flushed {
+				return nil, &StreamError{Err: err, Attempts: attempts, Flushed: true}
+			}
+			lastErr = err
+
+			class := e.providers[candidate.ProviderName].Classify(err, status)
+			if class == providers.Terminal {
+				return nil, &StreamError{Err: err, Attempts: attempts}
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, &StreamError{Err: ctxErr, Attempts: attempts}
+			}
+		}
+	}
+
+	return nil, &StreamError{Err: lastErr, Attempts: attempts}
+}
+
+// tryCandidateStream is tryCandidate's streaming counterpart: same
+// breaker gate, same per-provider attempt/backoff loop, but once any
+// attempt's relayStream call reports flushed, every subsequent failure
+// (including from a later attempt of the same candidate) is returned
+// immediately rather than retried, since content already reached the
+// client.
+func (e *Engine) tryCandidateStream(ctx context.Context, c router.Candidate, req *providers.CanonicalRequest, onDelta func(string, providers.Delta) error, attempts *[]Attempt) (*providers.Usage, bool, int, error) {
+	provider := e.providers[c.ProviderName]
+	br := e.breakers.Get(c.ProviderName, c.Model)
+
+	if !br.Allow() {
+		return nil, false, 0, errBreakerRejected
+	}
+
+	providerReq := *req
+	providerReq.Model = c.Model
+
+	var lastErr error
+	var lastStatus int
+	flushed := false
+
+	for attempt := 0; attempt < e.cfg.MaxAttemptsPerProvider; attempt++ {
+		if attempt > 0 {
+			wait := backoffFor(attempt-1, e.cfg.BaseBackoff, e.cfg.MaxBackoff, lastErr)
+			if !sleepWithinDeadline(ctx, wait) {
+				return nil, flushed, lastStatus, lastErr
+			}
+		}
+
+		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout(ctx, e.providerTimeout[c.ProviderName]))
+		usage, attemptFlushed, err := e.relayStream(attemptCtx, provider, &providerReq, c.ProviderName, onDelta)
+		cancel()
+		if attemptFlushed {
+			flushed = true
+		}
+
+		if err == nil {
+			br.RecordSuccess()
+			*attempts = append(*attempts, Attempt{Provider: c.ProviderName, Status: 200})
+			return usage, flushed, 200, nil
+		}
+
+		status := 0
+		var apiErr *providers.APIError
+		if errors.As(err, &apiErr) {
+			status = apiErr.StatusCode
+		}
+		*attempts = append(*attempts, Attempt{Provider: c.ProviderName, Status: status})
+
+		if flushed {
+			// Content already reached the client through this candidate:
+			// no more attempts, no reclassification, no failover.
+			return nil, true, status, err
+		}
+
+		class := provider.Classify(err, status)
+		if class != providers.Terminal {
+			br.RecordFailure()
+		}
+		lastErr, lastStatus = err, status
+
+		if class != providers.Retryable {
+			return nil, false, status, err
+		}
+	}
+	return nil, flushed, lastStatus, lastErr
+}
+
+// relayStream runs one Stream call and forwards each Delta to onDelta as
+// it arrives. providers.Provider.Stream never closes out itself (every
+// implementation leaves channel lifecycle to its caller), so relayStream
+// owns that here: it closes the provider-facing channel once Stream
+// returns and only then reports Stream's own error.
+func (e *Engine) relayStream(ctx context.Context, provider providers.Provider, req *providers.CanonicalRequest, providerName string, onDelta func(string, providers.Delta) error) (*providers.Usage, bool, error) {
+	providerChan := make(chan providers.Delta)
+	errCh := make(chan error, 1)
+	go func() {
+		err := provider.Stream(ctx, req, providerChan)
+		close(providerChan)
+		errCh <- err
+	}()
+
+	var usage *providers.Usage
+	flushed := false
+	for delta := range providerChan {
+		if delta.Usage != nil {
+			usage = delta.Usage
+		}
+		if err := onDelta(providerName, delta); err != nil {
+			// Drain so the goroutine above never blocks on a send nobody
+			// will receive; its own Stream call will still return on its
+			// own terms (every implementation selects on ctx being done).
+			for range providerChan {
+			}
+			<-errCh
+			return usage, flushed, err
+		}
+		if delta.Content != "" {
+			flushed = true
+		}
+	}
+	return usage, flushed, <-errCh
+}
+
 // pickFromTier weighted-selects among candidates not yet tried this
 // request and currently Ready() (a peek, not a consuming Allow()). If the
 // remaining eligible candidates' weights sum to zero, the tier is treated

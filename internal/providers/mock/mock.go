@@ -20,6 +20,19 @@ type Provider struct {
 	failureStatus int
 	rng           *rand.Rand
 	calls         atomic.Int64
+
+	// midStreamFailAfter/midStreamFailStatus configure Stream to fail
+	// partway through instead of finishing normally, via FailMidStream.
+	// Zero (the default) means "don't."
+	midStreamFailAfter  int
+	midStreamFailStatus int
+
+	// streamDeltaLatency, set via StreamDeltaLatency, delays each
+	// individual delta rather than just the call as a whole -- a real
+	// upstream paces tokens over real time, and proving the gateway
+	// forwards them incrementally rather than batching needs a fixture
+	// that also arrives incrementally.
+	streamDeltaLatency time.Duration
 }
 
 // New builds a mock provider that sleeps latency before every call and
@@ -39,6 +52,21 @@ func New(name string, latency time.Duration, failureRate float64, failureStatus 
 }
 
 func (p *Provider) Name() string { return p.name }
+
+// FailMidStream makes Stream send exactly afterDeltas word-deltas and
+// then fail instead of finishing normally — the "provider dies mid-
+// stream" scenario the README's Phase 8 gate requires a real test for.
+func (p *Provider) FailMidStream(afterDeltas, status int) {
+	p.midStreamFailAfter = afterDeltas
+	p.midStreamFailStatus = status
+}
+
+// StreamDeltaLatency makes Stream sleep d before sending each word-delta,
+// simulating a real provider's token-by-token pacing instead of handing
+// back every delta in one tight loop.
+func (p *Provider) StreamDeltaLatency(d time.Duration) {
+	p.streamDeltaLatency = d
+}
 
 // CallCount lets tests (and, from Phase 6 on, the cache gate) assert
 // whether the upstream was actually hit.
@@ -98,6 +126,16 @@ func (p *Provider) Stream(ctx context.Context, req *providers.CanonicalRequest, 
 	words := strings.Fields("mock response to: " + content)
 
 	for i, w := range words {
+		if p.midStreamFailAfter > 0 && i == p.midStreamFailAfter {
+			return &providers.APIError{StatusCode: p.midStreamFailStatus, Message: "mock: injected mid-stream failure"}
+		}
+		if p.streamDeltaLatency > 0 {
+			select {
+			case <-time.After(p.streamDeltaLatency):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 		chunk := w
 		if i < len(words)-1 {
 			chunk += " "

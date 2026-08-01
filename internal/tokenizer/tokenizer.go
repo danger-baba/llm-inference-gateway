@@ -45,3 +45,13 @@ func (c *Counter) CountMessages(messages []providers.Message) int {
 	}
 	return total
 }
+
+// CountText counts one string's tokens with no message-formatting
+// overhead applied. A streamed completion arrives as a sequence of
+// content fragments rather than one message, and — per the README — may
+// end without a usage block at all, so the gateway counts each fragment
+// on the way past and sums them, rather than tokenizing the whole reply
+// only after it's fully assembled.
+func (c *Counter) CountText(text string) int {
+	return len(c.enc.Encode(text, nil, nil))
+}
