@@ -131,3 +131,51 @@ func TestHandleRevokeKey_InvalidID(t *testing.T) {
 		t.Errorf("status = %d, want 400", rec.Code)
 	}
 }
+
+type fakePurger struct {
+	gotTenant string
+	deleted   int
+	err       error
+}
+
+func (f *fakePurger) PurgeTenant(_ context.Context, tenantID string) (int, error) {
+	f.gotTenant = tenantID
+	return f.deleted, f.err
+}
+
+func TestHandlePurgeCache_Success(t *testing.T) {
+	purger := &fakePurger{deleted: 3}
+	deps := adminDeps{purger: purger}
+
+	body, _ := json.Marshal(purgeCacheRequest{Tenant: "org-123"})
+	req := httptest.NewRequest(http.MethodPost, "/admin/cache/purge", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	handlePurgeCache(deps)(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if purger.gotTenant != "org-123" {
+		t.Errorf("PurgeTenant called with %q, want %q", purger.gotTenant, "org-123")
+	}
+	var resp purgeCacheResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Deleted != 3 {
+		t.Errorf("Deleted = %d, want 3", resp.Deleted)
+	}
+}
+
+func TestHandlePurgeCache_MissingTenant(t *testing.T) {
+	deps := adminDeps{purger: &fakePurger{}}
+
+	body, _ := json.Marshal(purgeCacheRequest{})
+	req := httptest.NewRequest(http.MethodPost, "/admin/cache/purge", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	handlePurgeCache(deps)(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}

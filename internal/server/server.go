@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/danger-baba/llm-inference-gateway/internal/auth"
+	"github.com/danger-baba/llm-inference-gateway/internal/cache/exact"
 	"github.com/danger-baba/llm-inference-gateway/internal/retry"
 	"github.com/danger-baba/llm-inference-gateway/internal/router"
 )
@@ -33,6 +34,10 @@ type Options struct {
 	RateLimiter              rateLimiter
 	DefaultTPM               int64
 	EstimateCompletionTokens int64
+
+	// ExactCache is nil when cache.exact.enabled is false.
+	ExactCache              *exact.Store
+	CacheNonzeroTemperature bool
 }
 
 type Server struct {
@@ -50,6 +55,17 @@ func New(opts Options) (*Server, error) {
 		return nil, fmt.Errorf("server: listen %s: %w", opts.Addr, err)
 	}
 
+	// Guard against the classic Go gotcha: assigning a nil *exact.Store
+	// directly into an interface field would produce a non-nil interface
+	// wrapping a nil pointer, so a later `!= nil` check in chat.go/admin.go
+	// would wrongly conclude the cache is enabled.
+	var cacheIface exactCache
+	var purgerIface cachePurger
+	if opts.ExactCache != nil {
+		cacheIface = opts.ExactCache
+		purgerIface = opts.ExactCache
+	}
+
 	chat := chatDeps{
 		router:                   opts.Router,
 		engine:                   opts.Engine,
@@ -57,11 +73,14 @@ func New(opts Options) (*Server, error) {
 		limiter:                  opts.RateLimiter,
 		defaultTPM:               opts.DefaultTPM,
 		estimateCompletionTokens: opts.EstimateCompletionTokens,
+		cache:                    cacheIface,
+		cacheNonzeroTemperature:  opts.CacheNonzeroTemperature,
 	}
 	admin := adminDeps{
 		issuer:      opts.AuthStore,
 		revoker:     opts.AuthStore,
 		invalidator: opts.AuthResolver,
+		purger:      purgerIface,
 	}
 	mux := newMux(opts.Redis, opts.Postgres, chat, opts.AuthResolver, admin)
 	handler := withRequestID(withRequestTimeout(opts.RequestTimeout, withMaxBody(opts.MaxBodyBytes, mux)))

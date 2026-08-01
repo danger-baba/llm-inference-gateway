@@ -201,6 +201,16 @@ type ExactCacheConfig struct {
 	CacheNonzeroTemperature bool     `yaml:"cache_nonzero_temperature"`
 }
 
+func (c ExactCacheConfig) validate() []error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.TTL.Std() <= 0 {
+		return []error{errors.New("cache.exact.ttl: must be > 0 when cache.exact.enabled is true")}
+	}
+	return nil
+}
+
 type HNSWConfig struct {
 	M              int `yaml:"m"`
 	EfConstruction int `yaml:"ef_construction"`
@@ -219,6 +229,10 @@ type SemanticCacheConfig struct {
 type CacheConfig struct {
 	Exact    ExactCacheConfig    `yaml:"exact"`
 	Semantic SemanticCacheConfig `yaml:"semantic"`
+}
+
+func (c CacheConfig) validate() []error {
+	return c.Exact.validate()
 }
 
 type RateLimitConfig struct {
@@ -322,6 +336,7 @@ func (c *Config) Validate() error {
 	}
 	errs = append(errs, c.Breaker.validate()...)
 	errs = append(errs, c.Retry.validate()...)
+	errs = append(errs, c.Cache.validate()...)
 	errs = append(errs, c.RateLimit.validate()...)
 	errs = append(errs, c.Observability.validate()...)
 	if len(errs) > 0 {

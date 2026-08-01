@@ -23,6 +23,7 @@ func newMux(redis, postgres Pinger, chat chatDeps, resolver identityResolver, ad
 	mux.HandleFunc("/v1/models", handleModels(chat.router.Aliases()))
 	mux.HandleFunc("POST /admin/keys", handleIssueKey(admin))
 	mux.HandleFunc("DELETE /admin/keys/{id}", handleRevokeKey(admin))
+	mux.HandleFunc("POST /admin/cache/purge", handlePurgeCache(admin))
 	return mux
 }
 

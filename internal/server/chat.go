@@ -10,15 +10,16 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/danger-baba/llm-inference-gateway/internal/cache/exact"
 	"github.com/danger-baba/llm-inference-gateway/internal/providers"
 	"github.com/danger-baba/llm-inference-gateway/internal/ratelimit"
 	"github.com/danger-baba/llm-inference-gateway/internal/retry"
 	"github.com/danger-baba/llm-inference-gateway/internal/router"
 )
 
-// tokenCounter and rateLimiter are narrow interfaces so the handler is
-// testable without tiktoken-go or a live Redis; *tokenizer.Counter and
-// *ratelimit.Limiter satisfy them respectively.
+// tokenCounter, rateLimiter, and exactCache are narrow interfaces so the
+// handler is testable without tiktoken-go or a live Redis; the concrete
+// tokenizer/ratelimit/cache/exact types satisfy them respectively.
 type tokenCounter interface {
 	CountMessages(messages []providers.Message) int
 }
@@ -26,6 +27,11 @@ type tokenCounter interface {
 type rateLimiter interface {
 	Reserve(ctx context.Context, s ratelimit.Scopes, cost int64) (ratelimit.Decision, error)
 	Adjust(ctx context.Context, s ratelimit.Scopes, delta int64) error
+}
+
+type exactCache interface {
+	Get(ctx context.Context, key string) (*providers.CanonicalResponse, bool, error)
+	Set(ctx context.Context, key string, resp *providers.CanonicalResponse) error
 }
 
 // chatDeps is everything the chat completions handler needs to route and
@@ -38,6 +44,9 @@ type chatDeps struct {
 	limiter                  rateLimiter
 	defaultTPM               int64
 	estimateCompletionTokens int64
+
+	cache                   exactCache // nil when cache.exact.enabled is false
+	cacheNonzeroTemperature bool
 }
 
 const streamNotYetSupportedMsg = "streaming is not supported yet (lands in Phase 8); send stream:false or omit it"
@@ -102,6 +111,24 @@ func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 			return
 		}
 
+		// Tier-1 cache: consulted only after a successful reservation, per
+		// the request lifecycle. A hit releases that reservation entirely,
+		// since no provider call is about to happen.
+		var cacheKey string
+		if deps.cache != nil && exact.Eligible(&req, deps.cacheNonzeroTemperature) {
+			if canon, err := exact.Canonicalize(&req); err == nil {
+				cacheKey = exact.Key(identity.OrgID.String(), canon)
+				if cached, hit, err := deps.cache.Get(r.Context(), cacheKey); err == nil && hit {
+					_ = deps.limiter.Adjust(r.Context(), scopes, cost)
+					w.Header().Set("X-Gateway-Cache", "exact")
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_ = json.NewEncoder(w).Encode(cached)
+					return
+				}
+			}
+		}
+
 		result, err := deps.engine.Execute(r.Context(), tiers, &req)
 		if err != nil {
 			// Nothing was served: refund the entire reservation rather
@@ -115,15 +142,18 @@ func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 
 		w.Header().Set("X-Gateway-Provider", result.Provider)
 		w.Header().Set("X-Gateway-Attempts", formatAttempts(result.Attempts))
+		w.Header().Set("X-Gateway-Cache", "none")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(result.Response)
 
-		// Reconcile after the response is on the wire: refund the
-		// difference if the estimate was too high, charge it if actual
-		// usage ran over. Over-reserving briefly is correct; the
-		// generation this reservation guarded against has already
-		// happened either way, so this never blocks or fails the response.
+		// Everything from here happens after the response is already on
+		// the wire, and never affects it: caching a completed response
+		// and reconciling its reservation are both settle-asynchronously
+		// concerns, not response-path ones.
+		if cacheKey != "" && deps.cache != nil {
+			_ = deps.cache.Set(r.Context(), cacheKey, result.Response)
+		}
 		actual := int64(result.Response.Usage.PromptTokens + result.Response.Usage.CompletionTokens)
 		_ = deps.limiter.Adjust(r.Context(), scopes, cost-actual)
 	}

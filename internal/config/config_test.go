@@ -246,6 +246,64 @@ observability:
 	}
 }
 
+func TestValidate_ExactCacheRules(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{
+			name: "enabled with zero TTL",
+			yaml: minimalValidConfig + `
+cache:
+  exact:
+    enabled: true
+    ttl: 0s
+`,
+			wantErr: "cache.exact.ttl",
+		},
+		{
+			name: "enabled with valid TTL",
+			yaml: minimalValidConfig + `
+cache:
+  exact:
+    enabled: true
+    ttl: 1h
+`,
+			wantErr: "",
+		},
+		{
+			name: "disabled with zero TTL is fine",
+			yaml: minimalValidConfig + `
+cache:
+  exact:
+    enabled: false
+    ttl: 0s
+`,
+			wantErr: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeTemp(t, tt.yaml)
+			_, err := Load(path)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Load() unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Load() expected error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Load() error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidate_ProviderRules(t *testing.T) {
 	tests := []struct {
 		name    string

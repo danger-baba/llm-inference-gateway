@@ -25,7 +25,7 @@ piece already exists.
 | 3 | Circuit breaker, retry, fallback | ✅ Done |
 | 4 | Auth, tenants, Postgres migrations | ✅ Done (admin API auth is a known gap — see Known Limitations) |
 | 5 | Token-aware rate limiter | ✅ Done |
-| 6 | Exact-match cache | ⏳ Planned |
+| 6 | Exact-match cache | ✅ Done |
 | 7 | Semantic cache | ⏳ Planned |
 | 8 | Streaming (SSE) | ⏳ Planned |
 | 9 | Ledger, metrics, dashboards | ⏳ Planned |

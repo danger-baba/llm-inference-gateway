@@ -27,10 +27,16 @@ type cacheInvalidator interface {
 	Invalidate(ctx context.Context, hash []byte) error
 }
 
+// cachePurger is satisfied by *cache/exact.Store.
+type cachePurger interface {
+	PurgeTenant(ctx context.Context, tenantID string) (int, error)
+}
+
 type adminDeps struct {
 	issuer      keyIssuer
 	revoker     keyRevoker
 	invalidator cacheInvalidator
+	purger      cachePurger
 }
 
 type issueKeyRequest struct {
@@ -109,5 +115,40 @@ func handleRevokeKey(deps adminDeps) http.HandlerFunc {
 		_ = deps.invalidator.Invalidate(r.Context(), hash)
 
 		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+type purgeCacheRequest struct {
+	Tenant string `json:"tenant"`
+}
+
+type purgeCacheResponse struct {
+	Deleted int `json:"deleted"`
+}
+
+// handlePurgeCache purges every exact-cache entry for a tenant (an org ID
+// — see docs/adr/0011 for why the cache's tenant boundary is the org, not
+// the team or key).
+func handlePurgeCache(deps adminDeps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req purgeCacheRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, r, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+			return
+		}
+		if req.Tenant == "" {
+			writeJSONError(w, r, http.StatusBadRequest, "tenant is required")
+			return
+		}
+
+		deleted, err := deps.purger.PurgeTenant(r.Context(), req.Tenant)
+		if err != nil {
+			writeJSONError(w, r, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(purgeCacheResponse{Deleted: deleted})
 	}
 }

@@ -15,6 +15,7 @@ import (
 
 	"github.com/danger-baba/llm-inference-gateway/internal/auth"
 	"github.com/danger-baba/llm-inference-gateway/internal/breaker"
+	"github.com/danger-baba/llm-inference-gateway/internal/cache/exact"
 	"github.com/danger-baba/llm-inference-gateway/internal/config"
 	"github.com/danger-baba/llm-inference-gateway/internal/ratelimit"
 	"github.com/danger-baba/llm-inference-gateway/internal/retry"
@@ -92,6 +93,11 @@ func run() error {
 	}
 	rateLimiter := ratelimit.New(redisClient, cfg.RateLimit.FailOpen)
 
+	var exactCache *exact.Store
+	if cfg.Cache.Exact.Enabled {
+		exactCache = exact.NewStore(redisClient, cfg.Cache.Exact.TTL.Std())
+	}
+
 	srv, err := server.New(server.Options{
 		Addr:                     cfg.Server.Addr,
 		ReadTimeout:              cfg.Server.ReadTimeout.Std(),
@@ -109,6 +115,8 @@ func run() error {
 		RateLimiter:              rateLimiter,
 		DefaultTPM:               cfg.RateLimit.DefaultTPM,
 		EstimateCompletionTokens: int64(cfg.RateLimit.EstimateCompletionTokens),
+		ExactCache:               exactCache,
+		CacheNonzeroTemperature:  cfg.Cache.Exact.CacheNonzeroTemperature,
 	})
 	if err != nil {
 		return err
