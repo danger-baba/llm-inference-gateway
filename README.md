@@ -836,7 +836,6 @@ Grafana is on `:3000` with the gateway dashboard preloaded.
 ```bash
 make test          # unit tests
 make test-race     # race detector
-make bench         # Go benchmarks
 make chaos         # kill and restart the gateway process mid-run, assert it recovers
 ```
 
