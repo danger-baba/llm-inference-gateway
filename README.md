@@ -23,7 +23,7 @@ piece already exists.
 | 1 | Project skeleton, strict config validation, `/healthz` + `/readyz`, graceful shutdown, Docker Compose stack, CI | ✅ Done |
 | 2 | Provider abstraction (mock/OpenAI/Anthropic), first proxy hop | ✅ Done |
 | 3 | Circuit breaker, retry, fallback | ✅ Done |
-| 4 | Auth, tenants, Postgres migrations | ⏳ Planned |
+| 4 | Auth, tenants, Postgres migrations | ✅ Done (admin API auth is a known gap — see Known Limitations) |
 | 5 | Token-aware rate limiter | ⏳ Planned |
 | 6 | Exact-match cache | ⏳ Planned |
 | 7 | Semantic cache | ⏳ Planned |
@@ -865,9 +865,18 @@ README can do.
 6. **Batching only helps self-hosted backends.** Against hosted providers it adds latency
    for no throughput gain, hence disabled by default.
 7. **Single-region.** No cross-region replication of cache or ledger.
+8. **`/admin/*` has no authentication.** `POST /admin/keys` and `DELETE /admin/keys/{id}`
+   are reachable by anyone who can reach the gateway's HTTP port — there is no admin
+   credential yet. Fine for local development; not fine for any shared or
+   internet-reachable deployment. See `docs/adr/0008`.
+9. **`weight: 0` and an unset weight look identical.** A provider that's the only member of
+   its tier with no explicit `weight:` set becomes completely undialable (Go's int zero
+   value collides with the deliberate "drain this provider" signal), and the resulting error
+   is indistinguishable from a real outage. Always set `weight` explicitly. See `docs/adr/0006`.
 
 ## Roadmap
 
+- [ ] Admin API authentication (static token, checked via constant-time comparison)
 - [ ] Shared breaker state via Redis pub/sub, with in-memory fast path
 - [ ] PII redaction and prompt-injection classification before egress
 - [ ] Per-tenant hard budget enforcement with pre-emptive alerting at 80%

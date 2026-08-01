@@ -14,6 +14,19 @@ services:
       - redis
       - postgres
 
+  migrate:
+    image: migrate/migrate:latest
+    volumes:
+      - ../migrations:/migrations:ro
+    entrypoint:
+      [
+        "migrate",
+        "-path=/migrations",
+        "-database=postgres://gateway:gateway@postgres:5432/gateway?sslmode=disable",
+      ]
+    depends_on:
+      - postgres
+
   redis:
     image: redis:7-alpine
     ports:

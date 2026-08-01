@@ -1,0 +1,5 @@
+DROP TABLE IF EXISTS usage_ledger_default;
+DROP TABLE IF EXISTS usage_ledger;
+DROP TABLE IF EXISTS virtual_keys;
+DROP TABLE IF EXISTS teams;
+DROP TABLE IF EXISTS orgs;

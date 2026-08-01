@@ -13,12 +13,19 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/danger-baba/llm-inference-gateway/internal/auth"
 	"github.com/danger-baba/llm-inference-gateway/internal/breaker"
 	"github.com/danger-baba/llm-inference-gateway/internal/config"
 	"github.com/danger-baba/llm-inference-gateway/internal/retry"
 	"github.com/danger-baba/llm-inference-gateway/internal/router"
 	"github.com/danger-baba/llm-inference-gateway/internal/server"
 )
+
+// identityCacheTTL matches the README's Redis key layout table
+// (vk:{sha256} -> ... TTL 5m) verbatim; it isn't exposed as a config
+// field because the README treats it as a fixed design constant, not a
+// tunable.
+const identityCacheTTL = 5 * time.Minute
 
 func main() {
 	if err := run(); err != nil {
@@ -74,6 +81,9 @@ func run() error {
 		MaxBackoff:             cfg.Retry.MaxBackoff.Std(),
 	})
 
+	authStore := auth.NewStore(pgPool)
+	authResolver := auth.NewCachingResolver(auth.NewRedisCache(redisClient), authStore, identityCacheTTL)
+
 	srv, err := server.New(server.Options{
 		Addr:            cfg.Server.Addr,
 		ReadTimeout:     cfg.Server.ReadTimeout.Std(),
@@ -85,6 +95,8 @@ func run() error {
 		Logger:          logger,
 		Router:          router.New(cfg),
 		Engine:          engine,
+		AuthStore:       authStore,
+		AuthResolver:    authResolver,
 	})
 	if err != nil {
 		return err

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/danger-baba/llm-inference-gateway/internal/auth"
 	"github.com/danger-baba/llm-inference-gateway/internal/retry"
 	"github.com/danger-baba/llm-inference-gateway/internal/router"
 )
@@ -24,6 +25,9 @@ type Options struct {
 
 	Router *router.Router
 	Engine *retry.Engine
+
+	AuthStore    *auth.Store
+	AuthResolver *auth.CachingResolver
 }
 
 type Server struct {
@@ -45,7 +49,12 @@ func New(opts Options) (*Server, error) {
 		router: opts.Router,
 		engine: opts.Engine,
 	}
-	mux := newMux(opts.Redis, opts.Postgres, chat)
+	admin := adminDeps{
+		issuer:      opts.AuthStore,
+		revoker:     opts.AuthStore,
+		invalidator: opts.AuthResolver,
+	}
+	mux := newMux(opts.Redis, opts.Postgres, chat, opts.AuthResolver, admin)
 	handler := withRequestID(withRequestTimeout(opts.RequestTimeout, withMaxBody(opts.MaxBodyBytes, mux)))
 
 	return newServer(ln, handler, opts.ReadTimeout, opts.ShutdownTimeout, opts.Logger), nil
