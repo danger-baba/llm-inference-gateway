@@ -20,7 +20,7 @@ func req(userContent string) *providers.CanonicalRequest {
 }
 
 func TestComplete_Success(t *testing.T) {
-	p := New("mock", time.Millisecond, 0)
+	p := New("mock", time.Millisecond, 0, 0)
 
 	resp, err := p.Complete(context.Background(), req("hello there"))
 	if err != nil {
@@ -38,7 +38,7 @@ func TestComplete_Success(t *testing.T) {
 }
 
 func TestComplete_InjectedFailure(t *testing.T) {
-	p := New("mock", time.Millisecond, 1) // always fails
+	p := New("mock", time.Millisecond, 1, 0) // always fails
 
 	_, err := p.Complete(context.Background(), req("hi"))
 	if err == nil {
@@ -54,7 +54,7 @@ func TestComplete_InjectedFailure(t *testing.T) {
 }
 
 func TestComplete_ContextCancelled(t *testing.T) {
-	p := New("mock", time.Hour, 0) // latency far longer than the test should wait
+	p := New("mock", time.Hour, 0, 0) // latency far longer than the test should wait
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -66,7 +66,7 @@ func TestComplete_ContextCancelled(t *testing.T) {
 }
 
 func TestStream_Success(t *testing.T) {
-	p := New("mock", time.Millisecond, 0)
+	p := New("mock", time.Millisecond, 0, 0)
 	out := make(chan providers.Delta, 32)
 
 	err := p.Stream(context.Background(), req("hello there"), out)
@@ -95,7 +95,7 @@ func TestStream_Success(t *testing.T) {
 }
 
 func TestStream_InjectedFailure(t *testing.T) {
-	p := New("mock", time.Millisecond, 1)
+	p := New("mock", time.Millisecond, 1, 0)
 	out := make(chan providers.Delta, 32)
 
 	err := p.Stream(context.Background(), req("hi"), out)
@@ -105,7 +105,7 @@ func TestStream_InjectedFailure(t *testing.T) {
 }
 
 func TestClassify(t *testing.T) {
-	p := New("mock", time.Millisecond, 0)
+	p := New("mock", time.Millisecond, 0, 0)
 
 	tests := []struct {
 		status int
@@ -126,9 +126,49 @@ func TestClassify(t *testing.T) {
 }
 
 func TestPricing_ZeroUntilPhase9(t *testing.T) {
-	p := New("mock", time.Millisecond, 0)
+	p := New("mock", time.Millisecond, 0, 0)
 	in, out := p.Pricing("anything")
 	if in != 0 || out != 0 {
 		t.Errorf("Pricing() = (%v, %v), want (0, 0)", in, out)
+	}
+}
+
+func TestComplete_ConfigurableFailureStatus(t *testing.T) {
+	p := New("mock", time.Millisecond, 1, 429)
+
+	_, err := p.Complete(context.Background(), req("hi"))
+	var apiErr *providers.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("Complete() error = %v, want *providers.APIError", err)
+	}
+	if apiErr.StatusCode != 429 {
+		t.Errorf("StatusCode = %d, want 429", apiErr.StatusCode)
+	}
+}
+
+func TestComplete_ZeroFailureStatusDefaultsTo500(t *testing.T) {
+	p := New("mock", time.Millisecond, 1, 0)
+
+	_, err := p.Complete(context.Background(), req("hi"))
+	var apiErr *providers.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("Complete() error = %v, want *providers.APIError", err)
+	}
+	if apiErr.StatusCode != 500 {
+		t.Errorf("StatusCode = %d, want default 500", apiErr.StatusCode)
+	}
+}
+
+func TestHealthCheck(t *testing.T) {
+	healthy := New("mock", time.Millisecond, 0, 0)
+	if err := healthy.HealthCheck(context.Background()); err != nil {
+		t.Errorf("HealthCheck() = %v, want nil for a healthy mock", err)
+	}
+
+	sick := New("mock", time.Millisecond, 1, 503)
+	err := sick.HealthCheck(context.Background())
+	var apiErr *providers.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != 503 {
+		t.Errorf("HealthCheck() = %v, want *providers.APIError{StatusCode: 503}", err)
 	}
 }

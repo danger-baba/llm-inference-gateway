@@ -31,6 +31,18 @@ redis:
 postgres:
   dsn_env: POSTGRES_DSN
   ping_timeout: 2s
+breaker:
+  error_rate_threshold: 0.5
+  min_requests: 20
+  window: 30s
+  cooldown: 10s
+  cooldown_max: 5m
+  half_open_probes: 3
+  prober_interval: 15s
+retry:
+  max_attempts_per_provider: 2
+  base_backoff: 200ms
+  max_backoff: 5s
 observability:
   log_level: info
 `
@@ -90,6 +102,18 @@ redis:
 postgres:
   dsn_env: POSTGRES_DSN
   ping_timeout: 2s
+breaker:
+  error_rate_threshold: 0.5
+  min_requests: 20
+  window: 30s
+  cooldown: 10s
+  cooldown_max: 5m
+  half_open_probes: 3
+  prober_interval: 15s
+retry:
+  max_attempts_per_provider: 2
+  base_backoff: 200ms
+  max_backoff: 5s
 observability:
   log_level: info
 `,
@@ -120,6 +144,18 @@ redis:
 postgres:
   dsn_env: POSTGRES_DSN
   ping_timeout: 2s
+breaker:
+  error_rate_threshold: 0.5
+  min_requests: 20
+  window: 30s
+  cooldown: 10s
+  cooldown_max: 5m
+  half_open_probes: 3
+  prober_interval: 15s
+retry:
+  max_attempts_per_provider: 2
+  base_backoff: 200ms
+  max_backoff: 5s
 observability:
   log_level: info
 `
@@ -147,6 +183,18 @@ redis:
 postgres:
   dsn_env: ""
   ping_timeout: 0s
+breaker:
+  error_rate_threshold: 0
+  min_requests: 0
+  window: 0s
+  cooldown: 0s
+  cooldown_max: 0s
+  half_open_probes: 0
+  prober_interval: 0s
+retry:
+  max_attempts_per_provider: 0
+  base_backoff: 0s
+  max_backoff: 0s
 observability:
   log_level: "not-a-level"
 `
@@ -166,6 +214,14 @@ observability:
 		"redis.dial_timeout",
 		"postgres.dsn_env",
 		"postgres.ping_timeout",
+		"breaker.error_rate_threshold",
+		"breaker.min_requests",
+		"breaker.window",
+		"breaker.cooldown",
+		"breaker.half_open_probes",
+		"breaker.prober_interval",
+		"retry.max_attempts_per_provider",
+		"retry.base_backoff",
 		"observability.log_level",
 	}
 	msg := err.Error()
@@ -242,6 +298,76 @@ providers:
 			}
 		})
 	}
+}
+
+func TestValidate_BreakerAndRetryOrderingRules(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{
+			name: "cooldown_max below cooldown",
+			yaml: minimalValidConfigWithout("breaker") + `
+breaker:
+  error_rate_threshold: 0.5
+  min_requests: 20
+  window: 30s
+  cooldown: 10s
+  cooldown_max: 5s
+  half_open_probes: 3
+  prober_interval: 15s
+`,
+			wantErr: "breaker.cooldown_max",
+		},
+		{
+			name: "max_backoff below base_backoff",
+			yaml: minimalValidConfigWithout("retry") + `
+retry:
+  max_attempts_per_provider: 2
+  base_backoff: 1s
+  max_backoff: 500ms
+`,
+			wantErr: "retry.max_backoff",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeTemp(t, tt.yaml)
+			_, err := Load(path)
+			if err == nil {
+				t.Fatalf("Load() expected error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Load() error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// minimalValidConfigWithout returns minimalValidConfig with the named
+// top-level section's own block stripped out, so a test can splice in its
+// own version of just that section without ending up with two conflicting
+// copies of it.
+func minimalValidConfigWithout(section string) string {
+	lines := strings.Split(minimalValidConfig, "\n")
+	var out []string
+	skipping := false
+	for _, line := range lines {
+		if line == section+":" {
+			skipping = true
+			continue
+		}
+		if skipping {
+			if strings.HasPrefix(line, "  ") {
+				continue
+			}
+			skipping = false
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
 }
 
 func TestDuration_UnmarshalYAML(t *testing.T) {

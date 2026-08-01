@@ -97,10 +97,12 @@ type ProviderConfig struct {
 	Weight    int      `yaml:"weight"`
 	Timeout   Duration `yaml:"timeout"`
 
-	// Latency and FailureRate configure the mock provider only; they're
-	// ignored for openai/anthropic.
-	Latency     Duration `yaml:"latency"`
-	FailureRate float64  `yaml:"failure_rate"`
+	// Latency, FailureRate, and FailureStatus configure the mock provider
+	// only; they're ignored for openai/anthropic. FailureStatus of 0
+	// defaults to 500 in the mock provider itself.
+	Latency       Duration `yaml:"latency"`
+	FailureRate   float64  `yaml:"failure_rate"`
+	FailureStatus int      `yaml:"failure_status"`
 }
 
 func (c ProviderConfig) validate(index int) []error {
@@ -141,12 +143,56 @@ type BreakerConfig struct {
 	Cooldown           Duration `yaml:"cooldown"`
 	CooldownMax        Duration `yaml:"cooldown_max"`
 	HalfOpenProbes     int      `yaml:"half_open_probes"`
+	// ProberInterval isn't in the README's example config; the background
+	// prober needs a cadence and nothing else in the schema specifies one.
+	// See docs/adr/0006.
+	ProberInterval Duration `yaml:"prober_interval"`
+}
+
+func (c BreakerConfig) validate() []error {
+	var errs []error
+	if c.ErrorRateThreshold <= 0 || c.ErrorRateThreshold > 1 {
+		errs = append(errs, errors.New("breaker.error_rate_threshold: must be in (0, 1]"))
+	}
+	if c.MinRequests < 1 {
+		errs = append(errs, errors.New("breaker.min_requests: must be >= 1"))
+	}
+	if c.Window.Std() <= 0 {
+		errs = append(errs, errors.New("breaker.window: must be > 0"))
+	}
+	if c.Cooldown.Std() <= 0 {
+		errs = append(errs, errors.New("breaker.cooldown: must be > 0"))
+	}
+	if c.CooldownMax.Std() < c.Cooldown.Std() {
+		errs = append(errs, errors.New("breaker.cooldown_max: must be >= breaker.cooldown"))
+	}
+	if c.HalfOpenProbes < 1 {
+		errs = append(errs, errors.New("breaker.half_open_probes: must be >= 1"))
+	}
+	if c.ProberInterval.Std() <= 0 {
+		errs = append(errs, errors.New("breaker.prober_interval: must be > 0"))
+	}
+	return errs
 }
 
 type RetryConfig struct {
 	MaxAttemptsPerProvider int      `yaml:"max_attempts_per_provider"`
 	BaseBackoff            Duration `yaml:"base_backoff"`
 	MaxBackoff             Duration `yaml:"max_backoff"`
+}
+
+func (c RetryConfig) validate() []error {
+	var errs []error
+	if c.MaxAttemptsPerProvider < 1 {
+		errs = append(errs, errors.New("retry.max_attempts_per_provider: must be >= 1"))
+	}
+	if c.BaseBackoff.Std() <= 0 {
+		errs = append(errs, errors.New("retry.base_backoff: must be > 0"))
+	}
+	if c.MaxBackoff.Std() < c.BaseBackoff.Std() {
+		errs = append(errs, errors.New("retry.max_backoff: must be >= retry.base_backoff"))
+	}
+	return errs
 }
 
 type ExactCacheConfig struct {
@@ -257,6 +303,8 @@ func (c *Config) Validate() error {
 	for i, p := range c.Providers {
 		errs = append(errs, p.validate(i)...)
 	}
+	errs = append(errs, c.Breaker.validate()...)
+	errs = append(errs, c.Retry.validate()...)
 	errs = append(errs, c.Observability.validate()...)
 	if len(errs) > 0 {
 		return errors.Join(errs...)

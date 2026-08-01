@@ -24,7 +24,7 @@ func buildProviders(cfgs []config.ProviderConfig) (map[string]providers.Provider
 	for _, c := range cfgs {
 		switch c.Type {
 		case "mock":
-			built[c.Name] = mock.New(c.Name, c.Latency.Std(), c.FailureRate)
+			built[c.Name] = mock.New(c.Name, c.Latency.Std(), c.FailureRate, c.FailureStatus)
 		case "openai":
 			built[c.Name] = openai.New(c.Name, c.BaseURL, os.Getenv(c.APIKeyEnv))
 		case "anthropic":

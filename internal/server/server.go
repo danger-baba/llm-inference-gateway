@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/danger-baba/llm-inference-gateway/internal/providers"
+	"github.com/danger-baba/llm-inference-gateway/internal/retry"
 	"github.com/danger-baba/llm-inference-gateway/internal/router"
 )
 
@@ -22,9 +22,8 @@ type Options struct {
 	Postgres        Pinger
 	Logger          *slog.Logger
 
-	Router          *router.Router
-	Providers       map[string]providers.Provider
-	ProviderTimeout map[string]time.Duration
+	Router *router.Router
+	Engine *retry.Engine
 }
 
 type Server struct {
@@ -43,9 +42,8 @@ func New(opts Options) (*Server, error) {
 	}
 
 	chat := chatDeps{
-		router:          opts.Router,
-		providers:       opts.Providers,
-		providerTimeout: opts.ProviderTimeout,
+		router: opts.Router,
+		engine: opts.Engine,
 	}
 	mux := newMux(opts.Redis, opts.Postgres, chat)
 	handler := withRequestID(withRequestTimeout(opts.RequestTimeout, withMaxBody(opts.MaxBodyBytes, mux)))

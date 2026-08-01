@@ -2,34 +2,51 @@ package server
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/danger-baba/llm-inference-gateway/internal/breaker"
 	"github.com/danger-baba/llm-inference-gateway/internal/config"
 	"github.com/danger-baba/llm-inference-gateway/internal/providers"
 	"github.com/danger-baba/llm-inference-gateway/internal/providers/mock"
+	"github.com/danger-baba/llm-inference-gateway/internal/retry"
 	"github.com/danger-baba/llm-inference-gateway/internal/router"
 )
 
-func testDeps(t *testing.T) chatDeps {
+func lenientBreakerConfig() breaker.Config {
+	return breaker.Config{
+		ErrorRateThreshold: 0.5,
+		MinRequests:        1000, // high enough that a handful of test calls never trips it
+		Window:             time.Second,
+		Cooldown:           time.Hour,
+		CooldownMax:        time.Hour,
+		HalfOpenProbes:     1,
+	}
+}
+
+func testDepsWithProvider(t *testing.T, name string, p providers.Provider) chatDeps {
 	t.Helper()
 	cfg := &config.Config{
-		Providers: []config.ProviderConfig{{Name: "mock-provider", Priority: 0}},
+		Providers: []config.ProviderConfig{{Name: name, Priority: 0, Weight: 1}},
 		ModelAliases: map[string]map[string]string{
-			"fast": {"mock-provider": "mock-model-v1"},
+			"fast": {name: "mock-model-v1"},
 		},
 	}
-	return chatDeps{
-		router: router.New(cfg),
-		providers: map[string]providers.Provider{
-			"mock-provider": mock.New("mock-provider", time.Millisecond, 0),
-		},
-		providerTimeout: map[string]time.Duration{"mock-provider": 5 * time.Second},
-	}
+	reg := breaker.NewRegistry(lenientBreakerConfig())
+	engine := retry.New(reg, map[string]providers.Provider{name: p}, map[string]time.Duration{name: 5 * time.Second}, retry.Config{
+		MaxAttemptsPerProvider: 2,
+		BaseBackoff:            time.Millisecond,
+		MaxBackoff:             5 * time.Millisecond,
+	})
+	return chatDeps{router: router.New(cfg), engine: engine}
+}
+
+func testDeps(t *testing.T) chatDeps {
+	t.Helper()
+	return testDepsWithProvider(t, "mock-provider", mock.New("mock-provider", time.Millisecond, 0, 0))
 }
 
 func doChatRequest(t *testing.T, deps chatDeps, body string) *httptest.ResponseRecorder {
@@ -49,6 +66,9 @@ func TestHandleChatCompletions_Success(t *testing.T) {
 	}
 	if got := rec.Header().Get("X-Gateway-Provider"); got != "mock-provider" {
 		t.Errorf("X-Gateway-Provider = %q, want %q", got, "mock-provider")
+	}
+	if got := rec.Header().Get("X-Gateway-Attempts"); got != "mock-provider:200" {
+		t.Errorf("X-Gateway-Attempts = %q, want %q", got, "mock-provider:200")
 	}
 	if rec.Header().Get("X-Request-Id") == "" {
 		t.Error("X-Request-Id header is empty")
@@ -87,58 +107,45 @@ func TestHandleChatCompletions_ValidationErrors(t *testing.T) {
 }
 
 func TestHandleChatCompletions_ProviderErrorPropagatesStatus(t *testing.T) {
-	cfg := &config.Config{
-		Providers: []config.ProviderConfig{{Name: "flaky", Priority: 0}},
-		ModelAliases: map[string]map[string]string{
-			"fast": {"flaky": "mock-model-v1"},
-		},
-	}
-	deps := chatDeps{
-		router: router.New(cfg),
-		providers: map[string]providers.Provider{
-			"flaky": mock.New("flaky", time.Millisecond, 1), // always injects a 500
-		},
-		providerTimeout: map[string]time.Duration{"flaky": 5 * time.Second},
-	}
+	// Terminal-classified (422) so the engine gives up after one call
+	// instead of retrying, and that status is what the client should see.
+	deps := testDepsWithProvider(t, "flaky", mock.New("flaky", time.Millisecond, 1, 422))
 
 	rec := doChatRequest(t, deps, `{"model":"fast","messages":[{"role":"user","content":"hi"}]}`)
-	if rec.Code != http.StatusInternalServerError {
-		t.Errorf("status = %d, want %d; body = %s", rec.Code, http.StatusInternalServerError, rec.Body.String())
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("status = %d, want %d; body = %s", rec.Code, http.StatusUnprocessableEntity, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Gateway-Attempts"); got != "flaky:422" {
+		t.Errorf("X-Gateway-Attempts = %q, want %q", got, "flaky:422")
 	}
 }
 
-func TestAttemptTimeout(t *testing.T) {
-	t.Run("shorter request deadline wins", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-		defer cancel()
-		got := attemptTimeout(ctx, time.Hour)
-		if got > 10*time.Millisecond || got <= 0 {
-			t.Errorf("attemptTimeout() = %v, want <= 10ms and > 0", got)
-		}
+func TestHandleChatCompletions_NoHealthyProviderReturns503(t *testing.T) {
+	reg := breaker.NewRegistry(breaker.Config{
+		ErrorRateThreshold: 0.5,
+		MinRequests:        1,
+		Window:             time.Second,
+		Cooldown:           time.Hour,
+		CooldownMax:        time.Hour,
+		HalfOpenProbes:     1,
 	})
+	reg.Get("down", "mock-model-v1").RecordFailure() // trip it before any request arrives
 
-	t.Run("configured timeout wins when shorter", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
-		defer cancel()
-		got := attemptTimeout(ctx, 50*time.Millisecond)
-		if got != 50*time.Millisecond {
-			t.Errorf("attemptTimeout() = %v, want 50ms", got)
-		}
+	p := mock.New("down", time.Millisecond, 0, 0)
+	cfg := &config.Config{
+		Providers:    []config.ProviderConfig{{Name: "down", Priority: 0, Weight: 1}},
+		ModelAliases: map[string]map[string]string{"fast": {"down": "mock-model-v1"}},
+	}
+	engine := retry.New(reg, map[string]providers.Provider{"down": p}, map[string]time.Duration{"down": time.Second}, retry.Config{
+		MaxAttemptsPerProvider: 1, BaseBackoff: time.Millisecond, MaxBackoff: time.Millisecond,
 	})
+	deps := chatDeps{router: router.New(cfg), engine: engine}
 
-	t.Run("no deadline on context", func(t *testing.T) {
-		got := attemptTimeout(context.Background(), 50*time.Millisecond)
-		if got != 50*time.Millisecond {
-			t.Errorf("attemptTimeout() = %v, want 50ms", got)
-		}
-	})
-
-	t.Run("already past deadline clamps to zero, not negative", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), -time.Second)
-		defer cancel()
-		got := attemptTimeout(ctx, time.Hour)
-		if got != 0 {
-			t.Errorf("attemptTimeout() = %v, want 0", got)
-		}
-	})
+	rec := doChatRequest(t, deps, `{"model":"fast","messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d; body = %s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if p.CallCount() != 0 {
+		t.Errorf("CallCount() = %d, want 0 (breaker was already open)", p.CallCount())
+	}
 }

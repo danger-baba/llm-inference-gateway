@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/danger-baba/llm-inference-gateway/internal/providers"
 )
@@ -216,6 +217,60 @@ func TestStream_Success(t *testing.T) {
 	}
 	if usage == nil || usage.PromptTokens != 7 || usage.CompletionTokens != 2 {
 		t.Errorf("usage = %+v, want prompt=7 completion=2", usage)
+	}
+}
+
+func TestComplete_ParsesRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "9")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, `{"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}}`)
+	}))
+	defer srv.Close()
+
+	p := New("anthropic", srv.URL, "test-key")
+	_, err := p.Complete(context.Background(), &providers.CanonicalRequest{
+		Model:    "claude-haiku-4-5",
+		Messages: []providers.Message{{Role: "user", Content: "hi"}},
+	})
+	var apiErr *providers.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("Complete() error = %v, want *providers.APIError", err)
+	}
+	if apiErr.RetryAfter != 9*time.Second {
+		t.Errorf("RetryAfter = %v, want 9s", apiErr.RetryAfter)
+	}
+}
+
+func TestHealthCheck(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			t.Errorf("path = %q, want /models", r.URL.Path)
+		}
+		if got := r.Header.Get("x-api-key"); got != "test-key" {
+			t.Errorf("x-api-key = %q, want %q", got, "test-key")
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	p := New("anthropic", srv.URL, "test-key")
+	if err := p.HealthCheck(context.Background()); err != nil {
+		t.Errorf("HealthCheck() = %v, want nil", err)
+	}
+}
+
+func TestHealthCheck_UpstreamError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	p := New("anthropic", srv.URL, "test-key")
+	err := p.HealthCheck(context.Background())
+	var apiErr *providers.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("HealthCheck() = %v, want *providers.APIError{StatusCode: 503}", err)
 	}
 }
 

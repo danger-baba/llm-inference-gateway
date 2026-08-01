@@ -1,6 +1,12 @@
 # Config for the gateway container in deploy/docker-compose.yml.
-# Sections below that no phase reads yet (breaker, retry, cache, rate_limit,
-# batching) are left empty/default; see docs/adr/0002.
+# Sections below that no phase reads yet (cache, rate_limit, batching) are
+# left empty/default; see docs/adr/0002.
+#
+# The two mock providers below are deliberately set up to demonstrate
+# Phase 3's failover live: "primary" always returns 429, so every request
+# retries it twice (retry.max_attempts_per_provider), then falls over to
+# "secondary", which always succeeds. curl the gateway a few times and
+# watch X-Gateway-Attempts and X-Gateway-Provider on the response.
 
 server:
   addr: ":8080"
@@ -19,17 +25,40 @@ postgres:
   ping_timeout: 2s
 
 providers:
-  - name: mock-provider
+  - name: primary
     type: mock
     priority: 0
     weight: 1
     timeout: 5s
-    latency: 50ms
+    latency: 20ms
+    failure_rate: 1
+    failure_status: 429
+  - name: secondary
+    type: mock
+    priority: 1
+    weight: 1
+    timeout: 5s
+    latency: 20ms
     failure_rate: 0
 
 model_aliases:
   fast:
-    mock-provider: mock-model-v1
+    primary: mock-model-v1
+    secondary: mock-model-v1
+
+breaker:
+  error_rate_threshold: 0.5
+  min_requests: 20
+  window: 30s
+  cooldown: 10s
+  cooldown_max: 5m
+  half_open_probes: 3
+  prober_interval: 15s
+
+retry:
+  max_attempts_per_provider: 2
+  base_backoff: 200ms
+  max_backoff: 5s
 
 observability:
   log_level: info

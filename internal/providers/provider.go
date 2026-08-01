@@ -6,6 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"strconv"
+	"time"
 )
 
 type Message struct {
@@ -84,11 +87,14 @@ func (f FailureClass) String() string {
 }
 
 // APIError carries the upstream HTTP status back through Complete/Stream so
-// Classify (and, later, the retry engine) can act on it without re-parsing
-// provider-specific error bodies.
+// Classify and the retry engine can act on it without re-parsing
+// provider-specific error bodies. RetryAfter is non-zero only when the
+// provider sent a Retry-After header, and takes precedence over computed
+// backoff when present.
 type APIError struct {
 	StatusCode int
 	Message    string
+	RetryAfter time.Duration
 }
 
 func (e *APIError) Error() string {
@@ -109,6 +115,27 @@ func ClassifyByStatus(status int) FailureClass {
 	}
 }
 
+// ParseRetryAfter interprets a Retry-After header value, which the HTTP
+// spec allows as either a delay in seconds or an HTTP-date. It returns 0
+// for an empty, unparseable, or already-past value.
+func ParseRetryAfter(header string) time.Duration {
+	if header == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(header); err == nil {
+		if secs < 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(header); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
 // Provider is implemented by every LLM backend the gateway can route to.
 type Provider interface {
 	Name() string
@@ -119,4 +146,14 @@ type Provider interface {
 	// implementation returns (0, 0) until then rather than fabricating
 	// numbers nothing yet consumes.
 	Pricing(model string) (inPerMTok, outPerMTok float64)
+}
+
+// HealthChecker is implemented by providers that expose a cheap
+// out-of-band way to check reachability. It's deliberately not part of
+// Provider itself — adding it there would force every implementation to
+// have a real health endpoint, which isn't true of every possible
+// provider — so the background prober type-asserts for it instead. See
+// docs/adr/0006.
+type HealthChecker interface {
+	HealthCheck(ctx context.Context) error
 }

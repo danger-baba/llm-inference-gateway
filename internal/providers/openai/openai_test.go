@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/danger-baba/llm-inference-gateway/internal/providers"
 )
@@ -143,6 +144,60 @@ func TestComplete_UpstreamError(t *testing.T) {
 	}
 	if apiErr.Message != "rate limited" {
 		t.Errorf("Message = %q, want %q", apiErr.Message, "rate limited")
+	}
+}
+
+func TestComplete_ParsesRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "17")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, `{"error": {"message": "rate limited"}}`)
+	}))
+	defer srv.Close()
+
+	p := New("openai", srv.URL, "test-key")
+	_, err := p.Complete(context.Background(), &providers.CanonicalRequest{
+		Model:    "gpt-4o-mini",
+		Messages: []providers.Message{{Role: "user", Content: "hi"}},
+	})
+	var apiErr *providers.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("Complete() error = %v, want *providers.APIError", err)
+	}
+	if apiErr.RetryAfter != 17*time.Second {
+		t.Errorf("RetryAfter = %v, want 17s", apiErr.RetryAfter)
+	}
+}
+
+func TestHealthCheck(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			t.Errorf("path = %q, want /models", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
+			t.Errorf("Authorization = %q, want %q", got, "Bearer test-key")
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	p := New("openai", srv.URL, "test-key")
+	if err := p.HealthCheck(context.Background()); err != nil {
+		t.Errorf("HealthCheck() = %v, want nil", err)
+	}
+}
+
+func TestHealthCheck_UpstreamError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	p := New("openai", srv.URL, "test-key")
+	err := p.HealthCheck(context.Background())
+	var apiErr *providers.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("HealthCheck() = %v, want *providers.APIError{StatusCode: 503}", err)
 	}
 }
 

@@ -172,9 +172,36 @@ func (p *Provider) Complete(ctx context.Context, req *providers.CanonicalRequest
 		return nil, fmt.Errorf("openai: read response: %w", err)
 	}
 	if resp.StatusCode >= 400 {
-		return nil, &providers.APIError{StatusCode: resp.StatusCode, Message: errorMessage(respBody)}
+		return nil, &providers.APIError{
+			StatusCode: resp.StatusCode,
+			Message:    errorMessage(respBody),
+			RetryAfter: providers.ParseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 	}
 	return translateResponse(respBody)
+}
+
+// HealthCheck hits GET /models, which is cheap and requires no completion
+// tokens — about as close to "free" as an authenticated OpenAI-compatible
+// endpoint gets.
+func (p *Provider) HealthCheck(ctx context.Context) error {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+"/models", nil)
+	if err != nil {
+		return fmt.Errorf("openai: build health check request: %w", err)
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+
+	resp, err := p.client.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return &providers.APIError{StatusCode: resp.StatusCode, Message: errorMessage(body)}
+	}
+	return nil
 }
 
 // Stream issues the same request with stream:true and forwards OpenAI's
@@ -203,7 +230,11 @@ func (p *Provider) Stream(ctx context.Context, req *providers.CanonicalRequest, 
 
 	if resp.StatusCode >= 400 {
 		respBody, _ := io.ReadAll(resp.Body)
-		return &providers.APIError{StatusCode: resp.StatusCode, Message: errorMessage(respBody)}
+		return &providers.APIError{
+			StatusCode: resp.StatusCode,
+			Message:    errorMessage(respBody),
+			RetryAfter: providers.ParseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 	}
 
 	scanner := bufio.NewScanner(resp.Body)

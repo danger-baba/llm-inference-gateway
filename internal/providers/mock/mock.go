@@ -14,21 +14,27 @@ import (
 )
 
 type Provider struct {
-	name        string
-	latency     time.Duration
-	failureRate float64
-	rng         *rand.Rand
-	calls       atomic.Int64
+	name          string
+	latency       time.Duration
+	failureRate   float64
+	failureStatus int
+	rng           *rand.Rand
+	calls         atomic.Int64
 }
 
 // New builds a mock provider that sleeps latency before every call and
-// fails a failureRate fraction of them (0 = never, 1 = always) with a 500.
-func New(name string, latency time.Duration, failureRate float64) *Provider {
+// fails a failureRate fraction of them (0 = never, 1 = always) with
+// failureStatus (0 defaults to 500).
+func New(name string, latency time.Duration, failureRate float64, failureStatus int) *Provider {
+	if failureStatus == 0 {
+		failureStatus = 500
+	}
 	return &Provider{
-		name:        name,
-		latency:     latency,
-		failureRate: failureRate,
-		rng:         rand.New(rand.NewSource(time.Now().UnixNano())),
+		name:          name,
+		latency:       latency,
+		failureRate:   failureRate,
+		failureStatus: failureStatus,
+		rng:           rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
@@ -48,7 +54,7 @@ func (p *Provider) Complete(ctx context.Context, req *providers.CanonicalRequest
 	}
 
 	if p.shouldFail() {
-		return nil, &providers.APIError{StatusCode: 500, Message: "mock: injected failure"}
+		return nil, &providers.APIError{StatusCode: p.failureStatus, Message: "mock: injected failure"}
 	}
 
 	content := lastUserMessage(req.Messages)
@@ -85,7 +91,7 @@ func (p *Provider) Stream(ctx context.Context, req *providers.CanonicalRequest, 
 	}
 
 	if p.shouldFail() {
-		return &providers.APIError{StatusCode: 500, Message: "mock: injected failure"}
+		return &providers.APIError{StatusCode: p.failureStatus, Message: "mock: injected failure"}
 	}
 
 	content := lastUserMessage(req.Messages)
@@ -121,6 +127,21 @@ func (p *Provider) Stream(ctx context.Context, req *providers.CanonicalRequest, 
 
 func (p *Provider) Classify(err error, status int) providers.FailureClass {
 	return providers.ClassifyByStatus(status)
+}
+
+// HealthCheck reuses the same failure injection as Complete/Stream, so
+// tests can drive the background prober's recovery detection without a
+// separate knob.
+func (p *Provider) HealthCheck(ctx context.Context) error {
+	select {
+	case <-time.After(p.latency):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if p.shouldFail() {
+		return &providers.APIError{StatusCode: p.failureStatus, Message: "mock: injected health-check failure"}
+	}
+	return nil
 }
 
 // Pricing is intentionally 0,0: see providers.Provider.Pricing.

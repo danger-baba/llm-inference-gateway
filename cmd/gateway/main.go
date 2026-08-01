@@ -13,7 +13,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/danger-baba/llm-inference-gateway/internal/breaker"
 	"github.com/danger-baba/llm-inference-gateway/internal/config"
+	"github.com/danger-baba/llm-inference-gateway/internal/retry"
 	"github.com/danger-baba/llm-inference-gateway/internal/router"
 	"github.com/danger-baba/llm-inference-gateway/internal/server"
 )
@@ -58,6 +60,20 @@ func run() error {
 		return err
 	}
 
+	breakerRegistry := breaker.NewRegistry(breaker.Config{
+		ErrorRateThreshold: cfg.Breaker.ErrorRateThreshold,
+		MinRequests:        cfg.Breaker.MinRequests,
+		Window:             cfg.Breaker.Window.Std(),
+		Cooldown:           cfg.Breaker.Cooldown.Std(),
+		CooldownMax:        cfg.Breaker.CooldownMax.Std(),
+		HalfOpenProbes:     cfg.Breaker.HalfOpenProbes,
+	})
+	engine := retry.New(breakerRegistry, providerSet, providerTimeouts, retry.Config{
+		MaxAttemptsPerProvider: cfg.Retry.MaxAttemptsPerProvider,
+		BaseBackoff:            cfg.Retry.BaseBackoff.Std(),
+		MaxBackoff:             cfg.Retry.MaxBackoff.Std(),
+	})
+
 	srv, err := server.New(server.Options{
 		Addr:            cfg.Server.Addr,
 		ReadTimeout:     cfg.Server.ReadTimeout.Std(),
@@ -68,8 +84,7 @@ func run() error {
 		Postgres:        postgresPinger{pgPool, cfg.Postgres.PingTimeout.Std()},
 		Logger:          logger,
 		Router:          router.New(cfg),
-		Providers:       providerSet,
-		ProviderTimeout: providerTimeouts,
+		Engine:          engine,
 	})
 	if err != nil {
 		return err
@@ -79,6 +94,9 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	prober := breaker.NewProber(breakerRegistry, providerSet, cfg.Breaker.ProberInterval.Std(), 5*time.Second)
+	go prober.Run(ctx)
 
 	if err := srv.Run(ctx); err != nil {
 		return fmt.Errorf("main: server: %w", err)
