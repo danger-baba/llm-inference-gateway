@@ -1,0 +1,23 @@
+# Config for the gateway container in deploy/docker-compose.yml.
+# Sections below that no phase reads yet (providers, breaker, retry, cache,
+# rate_limit, batching) are left empty/default; see docs/adr/0002.
+
+server:
+  addr: ":8080"
+  read_timeout: 30s
+  request_timeout: 120s
+  max_body_bytes: 1048576
+  shutdown_timeout: 15s
+
+redis:
+  addr: "redis:6379"
+  db: 0
+  dial_timeout: 2s
+
+postgres:
+  dsn_env: POSTGRES_DSN
+  ping_timeout: 2s
+
+observability:
+  log_level: info
+  log_request_bodies: false
