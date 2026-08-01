@@ -7,16 +7,18 @@ automatic failover, two-tier caching, and token-aware rate limiting.
 
 ![Go](https://img.shields.io/badge/Go-1.24-00ADD8)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Status](https://img.shields.io/badge/status-in%20progress-yellow)
+![Status](https://img.shields.io/badge/status-all%2011%20phases%20done-brightgreen)
 
 ---
 
 ## Build status
 
-This repository is being built in numbered phases, each gated on passing tests
-before moving to the next. Everything below this section describes the full
-target design; treat it as the spec being built toward, not a claim that every
-piece already exists.
+This repository was built in numbered phases, each gated on passing tests before moving to
+the next. All 11 are complete. The [Known limitations](#known-limitations) section is the
+honest account of what that doesn't cover — real, disclosed gaps (a few Postgres-dependent
+code paths unverified against a live database in this development environment, admin API
+auth, a couple of this project's own design choices going beyond the README's literal text)
+rather than a claim that nothing is missing.
 
 | Phase | Scope | Status |
 |---|---|---|
@@ -30,7 +32,7 @@ piece already exists.
 | 8 | Streaming (SSE) | ✅ Done |
 | 9 | Ledger, metrics, dashboards | ✅ Done (see Known Limitations for the Postgres-integration-testing gap) |
 | 10 | Load tests and benchmarks | ✅ Done |
-| 11 | Publish polish | ⏳ Planned |
+| 11 | Publish polish | ✅ Done |
 
 Architecture decisions made along the way, including deviations from this
 README's original config example, are recorded in [`docs/adr/`](docs/adr/).
@@ -978,6 +980,13 @@ README can do.
 23. **`make chaos` verifies the gateway recovers from being killed and restarted mid-run, not
     that no request is ever double-charged.** The latter needs reading back `usage_ledger`
     rows, which needs the same live Postgres note 22 describes. See `docs/adr/0015`.
+24. **The Docker-daemon-dependent parts of Getting Started (`docker compose up -d`, `make
+    migrate`, `make seed`, the curl/Grafana walkthrough) have not been verified by actually
+    running them, in any phase of this project's development.** Docker Desktop's service has
+    required admin rights unavailable in this environment since Phase 1. Everything not
+    requiring the daemon — build, vet, test, lint, `gofmt`, and `docker compose config`'s
+    syntax validation — was verified against a genuine fresh clone, not just the long-lived
+    development checkout. See `docs/adr/0016`.
 
 ## Roadmap
 
