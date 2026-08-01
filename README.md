@@ -21,7 +21,7 @@ piece already exists.
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Project skeleton, strict config validation, `/healthz` + `/readyz`, graceful shutdown, Docker Compose stack, CI | ✅ Done |
-| 2 | Provider abstraction (mock/OpenAI/Anthropic), first proxy hop | ⏳ Planned |
+| 2 | Provider abstraction (mock/OpenAI/Anthropic), first proxy hop | ✅ Done |
 | 3 | Circuit breaker, retry, fallback | ⏳ Planned |
 | 4 | Auth, tenants, Postgres migrations | ⏳ Planned |
 | 5 | Token-aware rate limiter | ⏳ Planned |

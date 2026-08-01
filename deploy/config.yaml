@@ -1,6 +1,6 @@
 # Config for the gateway container in deploy/docker-compose.yml.
-# Sections below that no phase reads yet (providers, breaker, retry, cache,
-# rate_limit, batching) are left empty/default; see docs/adr/0002.
+# Sections below that no phase reads yet (breaker, retry, cache, rate_limit,
+# batching) are left empty/default; see docs/adr/0002.
 
 server:
   addr: ":8080"
@@ -17,6 +17,19 @@ redis:
 postgres:
   dsn_env: POSTGRES_DSN
   ping_timeout: 2s
+
+providers:
+  - name: mock-provider
+    type: mock
+    priority: 0
+    weight: 1
+    timeout: 5s
+    latency: 50ms
+    failure_rate: 0
+
+model_aliases:
+  fast:
+    mock-provider: mock-model-v1
 
 observability:
   log_level: info

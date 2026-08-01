@@ -96,6 +96,11 @@ type ProviderConfig struct {
 	Priority  int      `yaml:"priority"`
 	Weight    int      `yaml:"weight"`
 	Timeout   Duration `yaml:"timeout"`
+
+	// Latency and FailureRate configure the mock provider only; they're
+	// ignored for openai/anthropic.
+	Latency     Duration `yaml:"latency"`
+	FailureRate float64  `yaml:"failure_rate"`
 }
 
 func (c ProviderConfig) validate(index int) []error {
@@ -114,6 +119,17 @@ func (c ProviderConfig) validate(index int) []error {
 	}
 	if c.Timeout.Std() <= 0 {
 		errs = append(errs, fmt.Errorf("providers[%d].timeout: must be > 0", index))
+	}
+	if c.FailureRate < 0 || c.FailureRate > 1 {
+		errs = append(errs, fmt.Errorf("providers[%d].failure_rate: must be between 0 and 1", index))
+	}
+	if c.Type == "openai" || c.Type == "anthropic" {
+		if c.BaseURL == "" {
+			errs = append(errs, fmt.Errorf("providers[%d].base_url: must not be empty for type %q", index, c.Type))
+		}
+		if c.APIKeyEnv == "" {
+			errs = append(errs, fmt.Errorf("providers[%d].api_key_env: must not be empty for type %q", index, c.Type))
+		}
 	}
 	return errs
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/danger-baba/llm-inference-gateway/internal/config"
+	"github.com/danger-baba/llm-inference-gateway/internal/router"
 	"github.com/danger-baba/llm-inference-gateway/internal/server"
 )
 
@@ -52,6 +53,11 @@ func run() error {
 	}
 	defer pgPool.Close()
 
+	providerSet, providerTimeouts, err := buildProviders(cfg.Providers)
+	if err != nil {
+		return err
+	}
+
 	srv, err := server.New(server.Options{
 		Addr:            cfg.Server.Addr,
 		ReadTimeout:     cfg.Server.ReadTimeout.Std(),
@@ -61,6 +67,9 @@ func run() error {
 		Redis:           redisPinger{redisClient, cfg.Redis.DialTimeout.Std()},
 		Postgres:        postgresPinger{pgPool, cfg.Postgres.PingTimeout.Std()},
 		Logger:          logger,
+		Router:          router.New(cfg),
+		Providers:       providerSet,
+		ProviderTimeout: providerTimeouts,
 	})
 	if err != nil {
 		return err

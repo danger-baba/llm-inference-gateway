@@ -15,10 +15,12 @@ type Pinger interface {
 	Ping(ctx context.Context) error
 }
 
-func newMux(redis, postgres Pinger) *http.ServeMux {
+func newMux(redis, postgres Pinger, chat chatDeps) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealthz)
 	mux.HandleFunc("/readyz", handleReadyz(redis, postgres))
+	mux.HandleFunc("/v1/chat/completions", handleChatCompletions(chat))
+	mux.HandleFunc("/v1/models", handleModels(chat.router.Aliases()))
 	return mux
 }
 

@@ -7,6 +7,9 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/danger-baba/llm-inference-gateway/internal/providers"
+	"github.com/danger-baba/llm-inference-gateway/internal/router"
 )
 
 type Options struct {
@@ -18,6 +21,10 @@ type Options struct {
 	Redis           Pinger
 	Postgres        Pinger
 	Logger          *slog.Logger
+
+	Router          *router.Router
+	Providers       map[string]providers.Provider
+	ProviderTimeout map[string]time.Duration
 }
 
 type Server struct {
@@ -35,8 +42,13 @@ func New(opts Options) (*Server, error) {
 		return nil, fmt.Errorf("server: listen %s: %w", opts.Addr, err)
 	}
 
-	mux := newMux(opts.Redis, opts.Postgres)
-	handler := withRequestTimeout(opts.RequestTimeout, withMaxBody(opts.MaxBodyBytes, mux))
+	chat := chatDeps{
+		router:          opts.Router,
+		providers:       opts.Providers,
+		providerTimeout: opts.ProviderTimeout,
+	}
+	mux := newMux(opts.Redis, opts.Postgres, chat)
+	handler := withRequestID(withRequestTimeout(opts.RequestTimeout, withMaxBody(opts.MaxBodyBytes, mux)))
 
 	return newServer(ln, handler, opts.ReadTimeout, opts.ShutdownTimeout, opts.Logger), nil
 }
