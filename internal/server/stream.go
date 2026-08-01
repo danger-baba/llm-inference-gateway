@@ -1,14 +1,18 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/danger-baba/llm-inference-gateway/internal/auth"
+	"github.com/danger-baba/llm-inference-gateway/internal/ledger"
+	"github.com/danger-baba/llm-inference-gateway/internal/metrics"
 	"github.com/danger-baba/llm-inference-gateway/internal/providers"
 	"github.com/danger-baba/llm-inference-gateway/internal/ratelimit"
 	"github.com/danger-baba/llm-inference-gateway/internal/retry"
@@ -80,7 +84,7 @@ func writeSSEDone(w http.ResponseWriter) error {
 func handleStreamingChatCompletion(
 	w http.ResponseWriter, r *http.Request, deps chatDeps,
 	req *providers.CanonicalRequest, identity auth.Identity,
-	tiers []router.Tier, cost int64, scopes ratelimit.Scopes, promptTokens int,
+	tiers []router.Tier, cost int64, scopes ratelimit.Scopes, promptTokens int, start time.Time,
 ) {
 	ctx := r.Context()
 
@@ -88,6 +92,10 @@ func handleStreamingChatCompletion(
 	if cached != nil {
 		_ = deps.limiter.Adjust(ctx, scopes, cost)
 		writeCachedStream(w, tier, cached)
+		recordCacheHitObservability(ctx, deps, identity, tier, cached, time.Since(start))
+		if len(cached.Choices) > 0 {
+			maybeLogResponseBody(ctx, deps, cached.Choices[0].Message.Content)
+		}
 		return
 	}
 
@@ -99,12 +107,14 @@ func handleStreamingChatCompletion(
 	completionTokens := 0
 	finishReason := ""
 	headersSent := false
+	currentProvider, currentModel := "", ""
 
 	// onDelta is called for every Delta a provider sends, in order, for
 	// as long as ExecuteStream keeps choosing candidates. The very first
 	// successful call is also the moment this handler commits to being
 	// an SSE response at all -- see the doc comment above.
-	onDelta := func(providerName string, d providers.Delta) error {
+	onDelta := func(providerName, model string, d providers.Delta) error {
+		currentProvider, currentModel = providerName, model
 		if d.Content != "" {
 			fullContent.WriteString(d.Content)
 			completionTokens += deps.counter.CountText(d.Content)
@@ -138,7 +148,7 @@ func handleStreamingChatCompletion(
 
 	result, err := deps.engine.ExecuteStream(ctx, tiers, req, onDelta)
 	if err != nil {
-		handleStreamError(w, r, deps, scopes, cost, promptTokens, completionTokens, headersSent, err)
+		handleStreamError(ctx, w, r, deps, identity, scopes, cost, promptTokens, completionTokens, headersSent, currentProvider, currentModel, start, err)
 		return
 	}
 
@@ -162,6 +172,9 @@ func handleStreamingChatCompletion(
 
 	actual := int64(usage.PromptTokens + usage.CompletionTokens)
 	_ = deps.limiter.Adjust(ctx, scopes, cost-actual)
+	recordSuccessObservability(ctx, deps, identity, result.Provider, result.Model,
+		*usage, len(result.Attempts), time.Since(start), result.ProviderDuration)
+	maybeLogResponseBody(ctx, deps, fullContent.String())
 
 	// The stream completed in full: this is exactly the "complete
 	// stream" the README says may be cached, built from what was
@@ -179,8 +192,8 @@ func handleStreamingChatCompletion(
 // ever flushed -- once it has, this cannot become a different status
 // code, because the 200 and the event-stream headers already went out.
 func handleStreamError(
-	w http.ResponseWriter, r *http.Request, deps chatDeps, scopes ratelimit.Scopes,
-	cost int64, promptTokens, completionTokens int, headersSent bool, err error,
+	ctx context.Context, w http.ResponseWriter, r *http.Request, deps chatDeps, identity auth.Identity, scopes ratelimit.Scopes,
+	cost int64, promptTokens, completionTokens int, headersSent bool, currentProvider, currentModel string, start time.Time, err error,
 ) {
 	flushed := headersSent
 	var streamErr *retry.StreamError
@@ -189,25 +202,62 @@ func handleStreamError(
 	}
 
 	if !flushed {
-		_ = deps.limiter.Adjust(r.Context(), scopes, cost)
-		writeEngineError(w, r, err)
+		_ = deps.limiter.Adjust(ctx, scopes, cost)
+		status, lastProvider := writeEngineError(w, r, err)
+		recordFailureObservability(status, lastProvider)
 		return
 	}
 
 	// Charge for what was actually generated before things went wrong;
 	// refund the rest of the original estimate.
 	actual := int64(promptTokens + completionTokens)
-	_ = deps.limiter.Adjust(r.Context(), scopes, cost-actual)
+	_ = deps.limiter.Adjust(ctx, scopes, cost-actual)
 
 	_ = writeSSEEvent(w, "error", map[string]any{
 		"error": map[string]string{
 			"message":    err.Error(),
-			"request_id": requestIDFromContext(r.Context()),
+			"request_id": requestIDFromContext(ctx),
 		},
 	})
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
+
+	// The wire-level status really was 200 -- headers already committed
+	// before this failure happened -- so that's what's recorded here; the
+	// logical failure is captured in the error event's own content, not
+	// in this status code, because there's no other status left to give.
+	recordPartialStreamObservability(ctx, deps, identity, currentProvider, currentModel, promptTokens, completionTokens, time.Since(start))
+}
+
+// recordPartialStreamObservability handles the one shape of row neither
+// recordSuccessObservability nor recordFailureObservability fit: a
+// stream that reached the client (so it wire-level succeeded, hence
+// StatusCode 200 below) but ended before finishing (so cost and usage
+// only cover what was actually generated, not the full estimate).
+func recordPartialStreamObservability(
+	ctx context.Context, deps chatDeps, identity auth.Identity,
+	provider, model string, promptTokens, completionTokens int, elapsed time.Duration,
+) {
+	metrics.RequestsTotal.WithLabelValues(strconv.Itoa(http.StatusOK), provider, "none").Inc()
+	metrics.RequestDuration.Observe(elapsed.Seconds())
+	metrics.TokensTotal.WithLabelValues("prompt").Add(float64(promptTokens))
+	metrics.TokensTotal.WithLabelValues("completion").Add(float64(completionTokens))
+
+	inPerMTok, outPerMTok := deps.engine.Pricing(provider, model)
+	costUSD := float64(promptTokens)/1e6*inPerMTok + float64(completionTokens)/1e6*outPerMTok
+	metrics.CostUSDTotal.Add(costUSD)
+
+	if deps.ledger == nil {
+		return
+	}
+	deps.ledger.Record(ledger.Entry{
+		RequestID: requestUUID(ctx), OrgID: identity.OrgID, TeamID: identity.TeamID, VirtualKeyID: identity.KeyID,
+		Provider: provider, Model: model,
+		PromptTokens: promptTokens, CompletionTokens: completionTokens,
+		CostUSD: costUSD, CacheTier: "none",
+		Attempts: 1, StatusCode: http.StatusOK, LatencyMS: int(elapsed.Milliseconds()),
+	})
 }
 
 // writeCachedStream serves a complete cached response (from either tier)

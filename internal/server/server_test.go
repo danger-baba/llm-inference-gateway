@@ -1,14 +1,19 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/danger-baba/llm-inference-gateway/internal/config"
+	"github.com/danger-baba/llm-inference-gateway/internal/router"
 )
 
 type fakePinger struct {
@@ -197,5 +202,47 @@ func TestNew_PortInUse_ReturnsError(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("New() expected error for address already in use, got nil")
+	}
+}
+
+func TestNew_MetricsEndpointServesRealCollectors(t *testing.T) {
+	srv, err := New(Options{
+		Addr:            "127.0.0.1:0",
+		ReadTimeout:     time.Second,
+		RequestTimeout:  time.Second,
+		MaxBodyBytes:    1024,
+		ShutdownTimeout: time.Second,
+		Redis:           fakePinger{},
+		Postgres:        fakePinger{},
+		Router:          router.New(&config.Config{}),
+	})
+	if err != nil {
+		t.Fatalf("New() unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = srv.Run(ctx) }()
+
+	resp, err := http.Get("http://" + srv.Addr() + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	// gateway_tokens_saved_total is a plain (non-Vec) counter, registered
+	// eagerly with a zero value at package init -- unlike a CounterVec
+	// (e.g. gateway_requests_total), which only appears in /metrics once
+	// some other test happens to have called WithLabelValues on it, so
+	// it's the one guaranteed to always be present regardless of test
+	// execution order.
+	if !bytes.Contains(body, []byte("gateway_tokens_saved_total")) {
+		t.Errorf("/metrics body does not mention gateway_tokens_saved_total; got a %d-byte body", len(body))
 	}
 }

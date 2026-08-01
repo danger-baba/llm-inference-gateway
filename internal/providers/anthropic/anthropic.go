@@ -343,5 +343,24 @@ func (p *Provider) Classify(_ error, status int) providers.FailureClass {
 	return providers.ClassifyByStatus(status)
 }
 
-// Pricing is intentionally 0,0: see providers.Provider.Pricing.
-func (p *Provider) Pricing(_ string) (float64, float64) { return 0, 0 }
+// pricePerMillionTokens is a point-in-time snapshot of Anthropic's
+// published per-model USD price per 1M tokens (input, output), used only
+// to compute the ledger's cost_usd column -- it is not fetched live and
+// will drift out of date. Verify against
+// https://www.anthropic.com/pricing before relying on it for real
+// billing; see docs/adr/0014.
+var pricePerMillionTokens = map[string][2]float64{
+	"claude-opus-4-1":   {15.00, 75.00},
+	"claude-sonnet-4-5": {3.00, 15.00},
+	"claude-haiku-4-5":  {1.00, 5.00},
+}
+
+// Pricing returns (0, 0) for any model not in pricePerMillionTokens
+// rather than guessing -- an unrecognized model should show up as an
+// obviously-zero cost in the ledger, not a plausible-looking wrong one.
+func (p *Provider) Pricing(model string) (float64, float64) {
+	if price, ok := pricePerMillionTokens[model]; ok {
+		return price[0], price[1]
+	}
+	return 0, 0
+}

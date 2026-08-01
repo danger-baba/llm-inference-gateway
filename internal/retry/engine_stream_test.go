@@ -14,10 +14,10 @@ import (
 
 // collectingOnDelta returns an onDelta callback that records every delta
 // it's given, plus which provider names it was called for.
-func collectingOnDelta() (func(string, providers.Delta) error, *[]providers.Delta, *[]string) {
+func collectingOnDelta() (func(string, string, providers.Delta) error, *[]providers.Delta, *[]string) {
 	var deltas []providers.Delta
 	var names []string
-	return func(name string, d providers.Delta) error {
+	return func(name, model string, d providers.Delta) error {
 		names = append(names, name)
 		deltas = append(deltas, d)
 		return nil
@@ -184,7 +184,7 @@ func TestExecuteStream_OnDeltaErrorStopsRelayAndIsReturned(t *testing.T) {
 
 	boom := errors.New("write: broken pipe")
 	calls := 0
-	onDelta := func(string, providers.Delta) error {
+	onDelta := func(string, string, providers.Delta) error {
 		calls++
 		if calls == 1 {
 			return boom

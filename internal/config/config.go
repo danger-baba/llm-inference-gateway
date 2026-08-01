@@ -296,6 +296,30 @@ func (c RateLimitConfig) validate() []error {
 	return errs
 }
 
+// LedgerConfig isn't in the README's example config -- the README
+// specifies the ledger writer's *behavior* (buffered channel, batch
+// inserter, drop-and-count when full) but not the specific knobs, so
+// these are this project's own choices. See docs/adr/0014.
+type LedgerConfig struct {
+	BufferSize    int      `yaml:"buffer_size"`
+	BatchSize     int      `yaml:"batch_size"`
+	FlushInterval Duration `yaml:"flush_interval"`
+}
+
+func (c LedgerConfig) validate() []error {
+	var errs []error
+	if c.BufferSize <= 0 {
+		errs = append(errs, errors.New("ledger.buffer_size: must be > 0"))
+	}
+	if c.BatchSize <= 0 {
+		errs = append(errs, errors.New("ledger.batch_size: must be > 0"))
+	}
+	if c.FlushInterval.Std() <= 0 {
+		errs = append(errs, errors.New("ledger.flush_interval: must be > 0"))
+	}
+	return errs
+}
+
 type BatchingConfig struct {
 	Enabled      bool     `yaml:"enabled"`
 	MaxBatchSize int      `yaml:"max_batch_size"`
@@ -338,6 +362,7 @@ type Config struct {
 	Cache          CacheConfig                  `yaml:"cache"`
 	RateLimit      RateLimitConfig              `yaml:"rate_limit"`
 	Batching       BatchingConfig               `yaml:"batching"`
+	Ledger         LedgerConfig                 `yaml:"ledger"`
 	Observability  ObservabilityConfig          `yaml:"observability"`
 }
 
@@ -377,6 +402,7 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.Retry.validate()...)
 	errs = append(errs, c.Cache.validate()...)
 	errs = append(errs, c.RateLimit.validate()...)
+	errs = append(errs, c.Ledger.validate()...)
 	errs = append(errs, c.Observability.validate()...)
 	if len(errs) > 0 {
 		return errors.Join(errs...)

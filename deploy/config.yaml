@@ -85,6 +85,11 @@ cache:
     ttl: 1h
     persist_path: /data/semantic_cache.gob
 
+ledger:
+  buffer_size: 10000
+  batch_size: 200
+  flush_interval: 1s
+
 observability:
   log_level: info
   log_request_bodies: false

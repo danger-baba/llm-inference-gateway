@@ -5,14 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/danger-baba/llm-inference-gateway/internal/auth"
 	"github.com/danger-baba/llm-inference-gateway/internal/cache/exact"
 	"github.com/danger-baba/llm-inference-gateway/internal/cache/semantic"
+	"github.com/danger-baba/llm-inference-gateway/internal/ledger"
+	"github.com/danger-baba/llm-inference-gateway/internal/metrics"
 	"github.com/danger-baba/llm-inference-gateway/internal/providers"
 	"github.com/danger-baba/llm-inference-gateway/internal/ratelimit"
 	"github.com/danger-baba/llm-inference-gateway/internal/retry"
@@ -52,6 +58,13 @@ type semanticCache interface {
 	Set(q semantic.Query, resp *providers.CanonicalResponse)
 }
 
+// ledgerRecorder is satisfied by *ledger.Writer; nil when Postgres isn't
+// configured, in which case usage simply isn't recorded (metrics still
+// are, since those don't depend on Postgres).
+type ledgerRecorder interface {
+	Record(e ledger.Entry)
+}
+
 // chatDeps is everything the chat completions handler needs to route and
 // execute a request. It's a struct rather than loose Options fields so
 // tests can build one directly without going through the full Server.
@@ -68,10 +81,18 @@ type chatDeps struct {
 
 	embedder      embedder      // nil when cache.semantic.enabled is false, or the model failed to load
 	semanticCache semanticCache // nil under the same conditions as embedder
+
+	ledger ledgerRecorder // nil when Postgres isn't configured
+
+	logger *slog.Logger
+	// logRequestBodies gates a debug-level log of the actual prompt and
+	// response content. Off by default -- see docs/adr/0014.
+	logRequestBodies bool
 }
 
 func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		var req providers.CanonicalRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSONError(w, r, http.StatusBadRequest, "invalid JSON body: "+err.Error())
@@ -85,6 +106,7 @@ func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 			writeJSONError(w, r, http.StatusBadRequest, "messages must not be empty")
 			return
 		}
+		maybeLogPromptBody(r.Context(), deps, req.Messages)
 
 		tiers, err := deps.router.Resolve(req.Model)
 		if err != nil || len(tiers) == 0 {
@@ -128,7 +150,7 @@ func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 		}
 
 		if req.Stream {
-			handleStreamingChatCompletion(w, r, deps, &req, identity, tiers, cost, scopes, promptTokens)
+			handleStreamingChatCompletion(w, r, deps, &req, identity, tiers, cost, scopes, promptTokens, start)
 			return
 		}
 
@@ -140,6 +162,10 @@ func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 		if cached != nil {
 			_ = deps.limiter.Adjust(r.Context(), scopes, cost)
 			writeCachedResponse(w, tier, cached)
+			recordCacheHitObservability(r.Context(), deps, identity, tier, cached, time.Since(start))
+			if len(cached.Choices) > 0 {
+				maybeLogResponseBody(r.Context(), deps, cached.Choices[0].Message.Content)
+			}
 			return
 		}
 
@@ -148,7 +174,8 @@ func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 			// Nothing was served: refund the entire reservation rather
 			// than letting a failed request sit charged against the budget.
 			_ = deps.limiter.Adjust(r.Context(), scopes, cost)
-			writeEngineError(w, r, err)
+			status, lastProvider := writeEngineError(w, r, err)
+			recordFailureObservability(status, lastProvider)
 			return
 		}
 
@@ -168,6 +195,11 @@ func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 		storeInCaches(r.Context(), deps, lookup, result.Response)
 		actual := int64(result.Response.Usage.PromptTokens + result.Response.Usage.CompletionTokens)
 		_ = deps.limiter.Adjust(r.Context(), scopes, cost-actual)
+		recordSuccessObservability(r.Context(), deps, identity, result.Provider, result.Model,
+			result.Response.Usage, len(result.Attempts), time.Since(start), result.ProviderDuration)
+		if len(result.Response.Choices) > 0 {
+			maybeLogResponseBody(r.Context(), deps, result.Response.Choices[0].Message.Content)
+		}
 	}
 }
 
@@ -265,6 +297,105 @@ func writeRateLimitRejection(w http.ResponseWriter, r *http.Request, d ratelimit
 	w.Header().Set("X-RateLimit-Scope", d.LimitingScope)
 	w.Header().Set("X-RateLimit-Remaining", "0")
 	writeJSONError(w, r, http.StatusTooManyRequests, fmt.Sprintf("rate limit exceeded at %s scope", d.LimitingScope))
+	metrics.RateLimitRejectionsTotal.WithLabelValues(d.LimitingScope).Inc()
+	metrics.RequestsTotal.WithLabelValues(strconv.Itoa(http.StatusTooManyRequests), "", "none").Inc()
+}
+
+// requestUUID parses the request ID context already carries (a real
+// UUID as of docs/adr/0013's requestid.go change) for use as
+// ledger.Entry.RequestID. A parse failure can't happen in practice since
+// this gateway is the one that generated the ID, but degrading to
+// uuid.Nil rather than panicking costs nothing.
+func requestUUID(ctx context.Context) uuid.UUID {
+	id, _ := uuid.Parse(requestIDFromContext(ctx))
+	return id
+}
+
+// recordCacheHitObservability is shared by the streaming and
+// non-streaming cache-hit paths: same metrics, same ledger row shape,
+// since a cache hit looks identical to an observer regardless of which
+// response format the client asked for.
+func recordCacheHitObservability(ctx context.Context, deps chatDeps, identity auth.Identity, tier string, cached *providers.CanonicalResponse, elapsed time.Duration) {
+	metrics.CacheHitsTotal.WithLabelValues(tier).Inc()
+	metrics.RequestsTotal.WithLabelValues(strconv.Itoa(http.StatusOK), "", tier).Inc()
+	metrics.RequestDuration.Observe(elapsed.Seconds())
+
+	tokensSaved := cached.Usage.PromptTokens + cached.Usage.CompletionTokens
+	metrics.TokensSavedTotal.Add(float64(tokensSaved))
+
+	if deps.ledger == nil {
+		return
+	}
+	deps.ledger.Record(ledger.Entry{
+		RequestID: requestUUID(ctx), OrgID: identity.OrgID, TeamID: identity.TeamID, VirtualKeyID: identity.KeyID,
+		Model:       cached.Model,
+		TokensSaved: tokensSaved, CacheTier: tier,
+		StatusCode: http.StatusOK, LatencyMS: int(elapsed.Milliseconds()),
+	})
+}
+
+// recordSuccessObservability is shared by the streaming and
+// non-streaming success paths (a stream that completes cleanly is, from
+// the ledger's point of view, exactly the same shape of row as a
+// non-streaming success).
+func recordSuccessObservability(
+	ctx context.Context, deps chatDeps, identity auth.Identity,
+	provider, model string, usage providers.Usage, attempts int,
+	elapsed, providerDuration time.Duration,
+) {
+	overhead := elapsed - providerDuration
+	if overhead < 0 {
+		overhead = 0 // clock/measurement noise, not a real negative cost
+	}
+	metrics.RequestsTotal.WithLabelValues(strconv.Itoa(http.StatusOK), provider, "none").Inc()
+	metrics.RequestDuration.Observe(elapsed.Seconds())
+	metrics.ProxyOverhead.Observe(overhead.Seconds())
+	metrics.TokensTotal.WithLabelValues("prompt").Add(float64(usage.PromptTokens))
+	metrics.TokensTotal.WithLabelValues("completion").Add(float64(usage.CompletionTokens))
+
+	inPerMTok, outPerMTok := deps.engine.Pricing(provider, model)
+	costUSD := float64(usage.PromptTokens)/1e6*inPerMTok + float64(usage.CompletionTokens)/1e6*outPerMTok
+	metrics.CostUSDTotal.Add(costUSD)
+
+	if deps.ledger == nil {
+		return
+	}
+	deps.ledger.Record(ledger.Entry{
+		RequestID: requestUUID(ctx), OrgID: identity.OrgID, TeamID: identity.TeamID, VirtualKeyID: identity.KeyID,
+		Provider: provider, Model: model,
+		PromptTokens: usage.PromptTokens, CompletionTokens: usage.CompletionTokens,
+		CostUSD: costUSD, CacheTier: "none",
+		Attempts: attempts, StatusCode: http.StatusOK, LatencyMS: int(elapsed.Milliseconds()),
+	})
+}
+
+// recordFailureObservability covers a request that never got a
+// response at all -- no ledger row, since there's no meaningful
+// provider/model/usage to attribute one to; only the outcome mix metric
+// moves.
+func recordFailureObservability(status int, lastProvider string) {
+	metrics.RequestsTotal.WithLabelValues(strconv.Itoa(status), lastProvider, "none").Inc()
+}
+
+// maybeLogPromptBody and maybeLogResponseBody are the only two places in
+// this package that can ever write prompt or completion content to logs,
+// and both are no-ops unless logRequestBodies is explicitly true (README,
+// Observability: "not logged by default; a config flag enables it for
+// debugging"). Kept as named, single-purpose functions rather than
+// inlined checks so grep for "logRequestBodies" finds every site that
+// could leak user data into logs, in one place.
+func maybeLogPromptBody(ctx context.Context, deps chatDeps, messages []providers.Message) {
+	if !deps.logRequestBodies {
+		return
+	}
+	deps.logger.Debug("prompt body", "request_id", requestUUID(ctx), "messages", messages)
+}
+
+func maybeLogResponseBody(ctx context.Context, deps chatDeps, content string) {
+	if !deps.logRequestBodies {
+		return
+	}
+	deps.logger.Debug("response body", "request_id", requestUUID(ctx), "content", content)
 }
 
 func formatAttempts(attempts []retry.Attempt) string {
@@ -277,8 +408,11 @@ func formatAttempts(attempts []retry.Attempt) string {
 
 // writeEngineError maps a retry.Error to an HTTP status: the underlying
 // provider's own status when there is one, 503 when every candidate's
-// breaker was open, 502 for anything else (e.g. a raw network error).
-func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
+// breaker was open, 502 for anything else (e.g. a raw network error). It
+// returns that status and the last provider actually attempted (empty if
+// none were, e.g. every breaker was open) so the caller can record
+// gateway_requests_total without re-deriving either.
+func writeEngineError(w http.ResponseWriter, r *http.Request, err error) (status int, lastProvider string) {
 	var retryErr *retry.Error
 	var attempts []retry.Attempt
 	if errors.As(err, &retryErr) {
@@ -286,9 +420,10 @@ func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
 	}
 	if len(attempts) > 0 {
 		w.Header().Set("X-Gateway-Attempts", formatAttempts(attempts))
+		lastProvider = attempts[len(attempts)-1].Provider
 	}
 
-	status := http.StatusBadGateway
+	status = http.StatusBadGateway
 	switch {
 	case errors.Is(err, retry.ErrNoHealthyProvider):
 		status = http.StatusServiceUnavailable
@@ -299,6 +434,7 @@ func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
 		}
 	}
 	writeJSONError(w, r, status, err.Error())
+	return status, lastProvider
 }
 
 func writeJSONError(w http.ResponseWriter, r *http.Request, status int, message string) {

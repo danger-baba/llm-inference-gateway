@@ -7,6 +7,8 @@ package breaker
 import (
 	"sync"
 	"time"
+
+	"github.com/danger-baba/llm-inference-gateway/internal/metrics"
 )
 
 type State int
@@ -68,7 +70,7 @@ func newBreaker(providerName, model string, cfg Config) *Breaker {
 	if windowSeconds < 1 {
 		windowSeconds = 1
 	}
-	return &Breaker{
+	b := &Breaker{
 		ProviderName:  providerName,
 		Model:         model,
 		cfg:           cfg,
@@ -76,6 +78,20 @@ func newBreaker(providerName, model string, cfg Config) *Breaker {
 		windowSeconds: windowSeconds,
 		curCooldown:   cfg.Cooldown,
 	}
+	metrics.BreakerState.WithLabelValues(providerName).Set(float64(Closed))
+	return b
+}
+
+// setState is the only place b.state is ever assigned, so
+// gateway_breaker_state stays in lockstep with every real transition
+// instead of being sampled on a timer. The metric is labelled only by
+// provider (matching the README's literal metric definition), so if two
+// models share one provider name, whichever transitions last wins the
+// gauge value for that provider -- an accepted, documented imprecision
+// rather than a per-(provider,model) cardinality blowup. See docs/adr/0014.
+func (b *Breaker) setState(s State) {
+	b.state = s
+	metrics.BreakerState.WithLabelValues(b.ProviderName).Set(float64(s))
 }
 
 func (b *Breaker) State() State {
@@ -113,7 +129,7 @@ func (b *Breaker) Allow() bool {
 	defer b.mu.Unlock()
 
 	if b.state == Open && time.Since(b.openedAt) >= b.curCooldown {
-		b.state = HalfOpen
+		b.setState(HalfOpen)
 		b.halfOpenAllowed = b.cfg.HalfOpenProbes
 		b.halfOpenWins = 0
 	}
@@ -141,7 +157,7 @@ func (b *Breaker) RecordSuccess() {
 	case HalfOpen:
 		b.halfOpenWins++
 		if b.halfOpenWins >= b.cfg.HalfOpenProbes {
-			b.state = Closed
+			b.setState(Closed)
 			b.curCooldown = b.cfg.Cooldown
 			b.resetWindow()
 		}
@@ -160,13 +176,13 @@ func (b *Breaker) RecordFailure() {
 		// Any half-open failure reopens immediately and doubles the
 		// cooldown, up to the configured ceiling.
 		b.curCooldown = min(b.curCooldown*2, b.cfg.CooldownMax)
-		b.state = Open
+		b.setState(Open)
 		b.openedAt = time.Now()
 	case Closed:
 		b.record(false)
 		if b.shouldTrip() {
 			b.curCooldown = b.cfg.Cooldown
-			b.state = Open
+			b.setState(Open)
 			b.openedAt = time.Now()
 		}
 	}

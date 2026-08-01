@@ -28,7 +28,7 @@ piece already exists.
 | 6 | Exact-match cache | ✅ Done |
 | 7 | Semantic cache | ✅ Done |
 | 8 | Streaming (SSE) | ✅ Done |
-| 9 | Ledger, metrics, dashboards | ⏳ Planned |
+| 9 | Ledger, metrics, dashboards | ✅ Done (see Known Limitations for the Postgres-integration-testing gap) |
 | 10 | Load tests and benchmarks | ⏳ Planned |
 | 11 | Publish polish | ⏳ Planned |
 
@@ -704,6 +704,11 @@ batching:
   max_batch_size: 16
   max_wait: 20ms
 
+ledger:
+  buffer_size: 10000     # entries; not in this file's original spec, see docs/adr/0014
+  batch_size: 200
+  flush_interval: 1s
+
 observability:
   log_level: info
   log_request_bodies: false     # contains user data; enable only to debug
@@ -909,6 +914,21 @@ README can do.
     `[DONE]`), not paced like a live generation.** There's nothing left to wait for once the
     full answer is already in hand, so a client watching timing can tell a cache hit from a
     real completion. See `docs/adr/0013`.
+18. **The ledger's Postgres writer/aggregator (`internal/ledger`) has not been exercised
+    against a live database.** Its buffering, batching, and drop-on-full logic is covered by
+    comprehensive unit tests against a fake inserter; the actual `COPY`/aggregate SQL against
+    a real `usage_ledger` table is unverified in this environment (no Postgres was reachable
+    during development — the same blocker noted for Phase 4's auth code). See `docs/adr/0014`.
+19. **Provider pricing tables (`internal/providers/{openai,anthropic}`) are a point-in-time
+    snapshot**, not fetched live. They will drift from the vendors' actual published prices
+    over time and need periodic manual updates. See `docs/adr/0014`.
+20. **`usage_ledger`'s monthly partitions are a static list for calendar year 2026**
+    (migration `0002`), not self-extending. Nothing in this repo creates next year's
+    partitions automatically; a production deployment needs a scheduled job for that. See
+    `docs/adr/0014`.
+21. **`GET /admin/usage`'s query parameters and response shape are this project's own
+    design**, not a literal reading of anything in the README — the README's entire spec for
+    this endpoint is "ledger aggregates by scope and window." See `docs/adr/0014`.
 
 ## Roadmap
 

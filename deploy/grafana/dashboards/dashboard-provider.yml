@@ -1,0 +1,16 @@
+# Tells Grafana to auto-load every dashboard JSON file dropped into this
+# same directory. Both this file and the dashboard JSON it points at live
+# under deploy/grafana/dashboards/, mounted read-only at
+# /etc/grafana/provisioning/dashboards -- see deploy/docker-compose.yml.
+apiVersion: 1
+
+providers:
+  - name: gateway
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards

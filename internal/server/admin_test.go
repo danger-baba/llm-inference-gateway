@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/danger-baba/llm-inference-gateway/internal/auth"
+	"github.com/danger-baba/llm-inference-gateway/internal/ledger"
 	"github.com/google/uuid"
 )
 
@@ -177,5 +179,118 @@ func TestHandlePurgeCache_MissingTenant(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+type fakeUsageAggregator struct {
+	got struct {
+		scope        ledger.Scope
+		id           uuid.UUID
+		since, until time.Time
+	}
+	result ledger.UsageAggregate
+	err    error
+}
+
+func (f *fakeUsageAggregator) Aggregate(_ context.Context, scope ledger.Scope, id uuid.UUID, since, until time.Time) (ledger.UsageAggregate, error) {
+	f.got.scope, f.got.id, f.got.since, f.got.until = scope, id, since, until
+	return f.result, f.err
+}
+
+func TestHandleUsage_Success(t *testing.T) {
+	orgID := uuid.New()
+	agg := &fakeUsageAggregator{result: ledger.UsageAggregate{
+		Requests: 42, PromptTokens: 100, CompletionTokens: 200, TokensSaved: 30, CostUSD: 1.23,
+		CacheHits: map[string]int64{"none": 40, "exact": 1, "semantic": 1},
+	}}
+	deps := adminDeps{usage: agg}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/usage?scope=org&id="+orgID.String(), nil)
+	rec := httptest.NewRecorder()
+	handleUsage(deps)(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if agg.got.scope != ledger.ScopeOrg || agg.got.id != orgID {
+		t.Errorf("Aggregate called with scope=%v id=%v, want org/%v", agg.got.scope, agg.got.id, orgID)
+	}
+	if !agg.got.since.Before(agg.got.until) {
+		t.Errorf("since (%v) is not before until (%v) with default window", agg.got.since, agg.got.until)
+	}
+	if got := agg.got.until.Sub(agg.got.since); got != 24*time.Hour {
+		t.Errorf("default window = %v, want 24h", got)
+	}
+
+	var resp usageResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Requests != 42 || resp.CostUSD != 1.23 || resp.TokensSaved != 30 {
+		t.Errorf("resp = %+v, want Requests=42 CostUSD=1.23 TokensSaved=30", resp)
+	}
+	if resp.CacheHits["exact"] != 1 {
+		t.Errorf("resp.CacheHits[exact] = %d, want 1", resp.CacheHits["exact"])
+	}
+}
+
+func TestHandleUsage_ExplicitWindow(t *testing.T) {
+	orgID := uuid.New()
+	agg := &fakeUsageAggregator{}
+	deps := adminDeps{usage: agg}
+
+	since := "2026-01-01T00:00:00Z"
+	until := "2026-02-01T00:00:00Z"
+	req := httptest.NewRequest(http.MethodGet, "/admin/usage?scope=org&id="+orgID.String()+"&since="+since+"&until="+until, nil)
+	rec := httptest.NewRecorder()
+	handleUsage(deps)(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	wantSince, _ := time.Parse(time.RFC3339, since)
+	wantUntil, _ := time.Parse(time.RFC3339, until)
+	if !agg.got.since.Equal(wantSince) || !agg.got.until.Equal(wantUntil) {
+		t.Errorf("window = [%v, %v], want [%v, %v]", agg.got.since, agg.got.until, wantSince, wantUntil)
+	}
+}
+
+func TestHandleUsage_InvalidScope(t *testing.T) {
+	deps := adminDeps{usage: &fakeUsageAggregator{}}
+	req := httptest.NewRequest(http.MethodGet, "/admin/usage?scope=bogus&id="+uuid.New().String(), nil)
+	rec := httptest.NewRecorder()
+	handleUsage(deps)(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandleUsage_InvalidID(t *testing.T) {
+	deps := adminDeps{usage: &fakeUsageAggregator{}}
+	req := httptest.NewRequest(http.MethodGet, "/admin/usage?scope=org&id=not-a-uuid", nil)
+	rec := httptest.NewRecorder()
+	handleUsage(deps)(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandleUsage_SinceAfterUntilRejected(t *testing.T) {
+	deps := adminDeps{usage: &fakeUsageAggregator{}}
+	req := httptest.NewRequest(http.MethodGet, "/admin/usage?scope=org&id="+uuid.New().String()+"&since=2026-02-01T00:00:00Z&until=2026-01-01T00:00:00Z", nil)
+	rec := httptest.NewRecorder()
+	handleUsage(deps)(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandleUsage_NoAggregatorConfigured(t *testing.T) {
+	deps := adminDeps{} // usage left nil, as when Postgres isn't configured
+	req := httptest.NewRequest(http.MethodGet, "/admin/usage?scope=org&id="+uuid.New().String(), nil)
+	rec := httptest.NewRecorder()
+	handleUsage(deps)(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", rec.Code)
 	}
 }

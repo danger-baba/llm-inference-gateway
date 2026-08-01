@@ -268,3 +268,17 @@ func TestClassify(t *testing.T) {
 		}
 	}
 }
+
+func TestPricing(t *testing.T) {
+	p := New("openai", "http://example.invalid", "key")
+
+	in, out := p.Pricing("gpt-4o-mini")
+	if in != 0.15 || out != 0.60 {
+		t.Errorf("Pricing(%q) = (%v, %v), want (0.15, 0.60)", "gpt-4o-mini", in, out)
+	}
+
+	in, out = p.Pricing("some-model-not-in-the-table")
+	if in != 0 || out != 0 {
+		t.Errorf("Pricing() for an unrecognized model = (%v, %v), want (0, 0), not a guess", in, out)
+	}
+}

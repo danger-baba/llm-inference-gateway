@@ -3,6 +3,10 @@ package breaker
 import (
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/danger-baba/llm-inference-gateway/internal/metrics"
 )
 
 func testConfig() Config {
@@ -38,6 +42,39 @@ func TestTrips_OnErrorRateAboveThresholdWithVolume(t *testing.T) {
 	}
 	if b.Allow() {
 		t.Error("Allow() = true immediately after tripping, want false (cooldown not elapsed)")
+	}
+}
+
+func TestSetState_UpdatesBreakerStateGauge(t *testing.T) {
+	// A distinct provider name keeps this test's gauge reads from
+	// colliding with every other test in this file writing to the same
+	// process-global metric under labels "p"/"flaky"/etc.
+	const provider = "gauge-test-provider"
+	gauge := func() float64 { return testutil.ToFloat64(metrics.BreakerState.WithLabelValues(provider)) }
+
+	b := newBreaker(provider, "m", testConfig())
+	if got := gauge(); got != 0 {
+		t.Fatalf("gauge on creation = %v, want 0 (Closed)", got)
+	}
+
+	b.RecordSuccess()
+	b.RecordFailure()
+	b.RecordFailure()
+	b.RecordFailure() // trips: 3/4 failures >= threshold, volume >= MinRequests
+	if got := gauge(); got != 2 {
+		t.Fatalf("gauge after tripping = %v, want 2 (Open)", got)
+	}
+
+	time.Sleep(testConfig().Cooldown + 5*time.Millisecond)
+	b.Allow() // Open -> HalfOpen once cooldown elapses
+	if got := gauge(); got != 1 {
+		t.Fatalf("gauge after cooldown elapses = %v, want 1 (HalfOpen)", got)
+	}
+
+	b.RecordSuccess()
+	b.RecordSuccess() // HalfOpenProbes=2 consecutive successes -> Closed
+	if got := gauge(); got != 0 {
+		t.Fatalf("gauge after recovering = %v, want 0 (Closed)", got)
 	}
 }
 

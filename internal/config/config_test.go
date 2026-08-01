@@ -46,6 +46,10 @@ retry:
 rate_limit:
   default_tpm: 200000
   estimate_completion_tokens: 512
+ledger:
+  buffer_size: 10000
+  batch_size: 200
+  flush_interval: 1s
 observability:
   log_level: info
 `
@@ -485,6 +489,74 @@ retry:
 		t.Run(tt.name, func(t *testing.T) {
 			path := writeTemp(t, tt.yaml)
 			_, err := Load(path)
+			if err == nil {
+				t.Fatalf("Load() expected error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Load() error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidate_LedgerRules(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{
+			name: "zero buffer_size",
+			yaml: minimalValidConfigWithout("ledger") + `
+ledger:
+  buffer_size: 0
+  batch_size: 200
+  flush_interval: 1s
+`,
+			wantErr: "ledger.buffer_size",
+		},
+		{
+			name: "zero batch_size",
+			yaml: minimalValidConfigWithout("ledger") + `
+ledger:
+  buffer_size: 10000
+  batch_size: 0
+  flush_interval: 1s
+`,
+			wantErr: "ledger.batch_size",
+		},
+		{
+			name: "zero flush_interval",
+			yaml: minimalValidConfigWithout("ledger") + `
+ledger:
+  buffer_size: 10000
+  batch_size: 200
+  flush_interval: 0s
+`,
+			wantErr: "ledger.flush_interval",
+		},
+		{
+			name: "valid settings",
+			yaml: minimalValidConfigWithout("ledger") + `
+ledger:
+  buffer_size: 10000
+  batch_size: 200
+  flush_interval: 1s
+`,
+			wantErr: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeTemp(t, tt.yaml)
+			_, err := Load(path)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Load() unexpected error: %v", err)
+				}
+				return
+			}
 			if err == nil {
 				t.Fatalf("Load() expected error containing %q, got nil", tt.wantErr)
 			}

@@ -33,6 +33,10 @@ type Provider struct {
 	// forwards them incrementally rather than batching needs a fixture
 	// that also arrives incrementally.
 	streamDeltaLatency time.Duration
+
+	// inPerMTok/outPerMTok default to 0,0 (no real vendor cost); set via
+	// SetPricing.
+	inPerMTok, outPerMTok float64
 }
 
 // New builds a mock provider that sleeps latency before every call and
@@ -182,8 +186,15 @@ func (p *Provider) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
-// Pricing is intentionally 0,0: see providers.Provider.Pricing.
-func (p *Provider) Pricing(_ string) (float64, float64) { return 0, 0 }
+// SetPricing lets tests exercise real cost computation against a mock
+// provider without needing a real vendor price table.
+func (p *Provider) SetPricing(inPerMTok, outPerMTok float64) {
+	p.inPerMTok, p.outPerMTok = inPerMTok, outPerMTok
+}
+
+// Pricing defaults to 0,0 -- a mock provider has no real vendor cost --
+// unless a test opts in via SetPricing.
+func (p *Provider) Pricing(_ string) (float64, float64) { return p.inPerMTok, p.outPerMTok }
 
 func (p *Provider) shouldFail() bool {
 	if p.failureRate <= 0 {

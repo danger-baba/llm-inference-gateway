@@ -125,11 +125,20 @@ func TestClassify(t *testing.T) {
 	}
 }
 
-func TestPricing_ZeroUntilPhase9(t *testing.T) {
+func TestPricing_ZeroByDefault(t *testing.T) {
 	p := New("mock", time.Millisecond, 0, 0)
 	in, out := p.Pricing("anything")
 	if in != 0 || out != 0 {
 		t.Errorf("Pricing() = (%v, %v), want (0, 0)", in, out)
+	}
+}
+
+func TestPricing_SetPricingOverridesDefault(t *testing.T) {
+	p := New("mock", time.Millisecond, 0, 0)
+	p.SetPricing(1.5, 3)
+	in, out := p.Pricing("anything")
+	if in != 1.5 || out != 3 {
+		t.Errorf("Pricing() = (%v, %v), want (1.5, 3)", in, out)
 	}
 }
 

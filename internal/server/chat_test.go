@@ -12,11 +12,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/danger-baba/llm-inference-gateway/internal/auth"
 	"github.com/danger-baba/llm-inference-gateway/internal/breaker"
 	"github.com/danger-baba/llm-inference-gateway/internal/cache/semantic"
 	"github.com/danger-baba/llm-inference-gateway/internal/config"
+	"github.com/danger-baba/llm-inference-gateway/internal/ledger"
+	"github.com/danger-baba/llm-inference-gateway/internal/metrics"
 	"github.com/danger-baba/llm-inference-gateway/internal/providers"
 	"github.com/danger-baba/llm-inference-gateway/internal/providers/mock"
 	"github.com/danger-baba/llm-inference-gateway/internal/ratelimit"
@@ -167,6 +170,14 @@ func (f *fakeSemanticCache) Set(_ semantic.Query, resp *providers.CanonicalRespo
 	f.lastSetResp = resp
 }
 
+type fakeLedger struct {
+	entries []ledger.Entry
+}
+
+func (f *fakeLedger) Record(e ledger.Entry) {
+	f.entries = append(f.entries, e)
+}
+
 func doChatRequest(t *testing.T, deps chatDeps, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
@@ -216,6 +227,8 @@ func TestHandleChatCompletions_RateLimitRejected(t *testing.T) {
 	limiter := &fakeRateLimiter{allow: false, limitingScope: "key", retryAfter: 7 * time.Second}
 	deps.limiter = limiter
 
+	rejectionsBefore := testutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("key"))
+
 	rec := doChatRequest(t, deps, `{"model":"fast","messages":[{"role":"user","content":"hi"}]}`)
 
 	if rec.Code != http.StatusTooManyRequests {
@@ -229,6 +242,31 @@ func TestHandleChatCompletions_RateLimitRejected(t *testing.T) {
 	}
 	if limiter.adjustCalls != 0 {
 		t.Errorf("Adjust called %d times, want 0 (nothing was reserved)", limiter.adjustCalls)
+	}
+
+	if got := testutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("key")) - rejectionsBefore; got != 1 {
+		t.Errorf("gateway_ratelimit_rejections_total{scope=key} increased by %v, want 1", got)
+	}
+}
+
+func TestHandleChatCompletions_CacheHit_IncrementsCacheMetrics(t *testing.T) {
+	p := mock.New("mock-provider", time.Millisecond, 0, 0)
+	deps := testDepsWithProvider(t, "mock-provider", p)
+	deps.cache = newFakeExactCache()
+
+	body := `{"model":"fast","temperature":0,"messages":[{"role":"user","content":"hi"}]}`
+	doChatRequest(t, deps, body) // primes the cache
+
+	hitsBefore := testutil.ToFloat64(metrics.CacheHitsTotal.WithLabelValues("exact"))
+	savedBefore := testutil.ToFloat64(metrics.TokensSavedTotal)
+
+	doChatRequest(t, deps, body)
+
+	if got := testutil.ToFloat64(metrics.CacheHitsTotal.WithLabelValues("exact")) - hitsBefore; got != 1 {
+		t.Errorf("gateway_cache_hits_total{tier=exact} increased by %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.TokensSavedTotal) - savedBefore; got <= 0 {
+		t.Errorf("gateway_tokens_saved_total increased by %v, want > 0", got)
 	}
 }
 
@@ -270,6 +308,100 @@ func TestHandleChatCompletions_ProviderErrorPropagatesStatus(t *testing.T) {
 	limiter := deps.limiter.(*fakeRateLimiter)
 	if limiter.adjustCalls != 1 {
 		t.Errorf("Adjust called %d times, want 1 (a failed request must refund its reservation)", limiter.adjustCalls)
+	}
+}
+
+func TestHandleChatCompletions_Success_RecordsLedgerEntryWithCost(t *testing.T) {
+	p := mock.New("mock-provider", time.Millisecond, 0, 0)
+	p.SetPricing(2, 4) // $2/$4 per 1M tokens in/out, so cost is nonzero and checkable
+	deps := testDepsWithProvider(t, "mock-provider", p)
+	fl := &fakeLedger{}
+	deps.ledger = fl
+
+	rec := doChatRequest(t, deps, `{"model":"fast","messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+
+	var resp providers.CanonicalResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if len(fl.entries) != 1 {
+		t.Fatalf("ledger entries recorded = %d, want 1", len(fl.entries))
+	}
+	e := fl.entries[0]
+	if e.Provider != "mock-provider" {
+		t.Errorf("Provider = %q, want %q", e.Provider, "mock-provider")
+	}
+	if e.Model != "mock-model-v1" {
+		t.Errorf("Model = %q, want the vendor model string %q, not the alias", e.Model, "mock-model-v1")
+	}
+	if e.PromptTokens != resp.Usage.PromptTokens || e.CompletionTokens != resp.Usage.CompletionTokens {
+		t.Errorf("token counts = (%d, %d), want (%d, %d) matching the response", e.PromptTokens, e.CompletionTokens, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+	}
+	wantCost := float64(resp.Usage.PromptTokens)/1e6*2 + float64(resp.Usage.CompletionTokens)/1e6*4
+	if e.CostUSD != wantCost {
+		t.Errorf("CostUSD = %v, want %v", e.CostUSD, wantCost)
+	}
+	if e.CacheTier != "none" {
+		t.Errorf("CacheTier = %q, want %q", e.CacheTier, "none")
+	}
+	if e.StatusCode != http.StatusOK {
+		t.Errorf("StatusCode = %d, want 200", e.StatusCode)
+	}
+	if e.Attempts != 1 {
+		t.Errorf("Attempts = %d, want 1", e.Attempts)
+	}
+	if e.OrgID != testIdentity().OrgID {
+		t.Errorf("OrgID = %v, want %v", e.OrgID, testIdentity().OrgID)
+	}
+}
+
+func TestHandleChatCompletions_CacheHit_RecordsLedgerEntryWithTokensSavedAndZeroCost(t *testing.T) {
+	p := mock.New("mock-provider", time.Millisecond, 0, 0)
+	p.SetPricing(2, 4)
+	deps := testDepsWithProvider(t, "mock-provider", p)
+	deps.cache = newFakeExactCache()
+	fl := &fakeLedger{}
+	deps.ledger = fl
+
+	body := `{"model":"fast","temperature":0,"messages":[{"role":"user","content":"hi"}]}`
+	doChatRequest(t, deps, body) // primes the cache; ledger entry #1
+
+	second := doChatRequest(t, deps, body)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second request status = %d, want 200; body = %s", second.Code, second.Body.String())
+	}
+
+	if len(fl.entries) != 2 {
+		t.Fatalf("ledger entries recorded = %d, want 2 (one per request)", len(fl.entries))
+	}
+	hit := fl.entries[1]
+	if hit.CacheTier != "exact" {
+		t.Errorf("CacheTier = %q, want %q", hit.CacheTier, "exact")
+	}
+	if hit.CostUSD != 0 {
+		t.Errorf("CostUSD = %v, want 0 on a cache hit", hit.CostUSD)
+	}
+	if hit.TokensSaved == 0 {
+		t.Error("TokensSaved = 0, want the cached response's token count")
+	}
+	if hit.PromptTokens != 0 || hit.CompletionTokens != 0 {
+		t.Errorf("PromptTokens/CompletionTokens = %d/%d, want 0/0 on a cache hit (no provider call happened)", hit.PromptTokens, hit.CompletionTokens)
+	}
+}
+
+func TestHandleChatCompletions_EngineFailure_DoesNotRecordLedgerEntry(t *testing.T) {
+	deps := testDepsWithProvider(t, "flaky", mock.New("flaky", time.Millisecond, 1, 422))
+	fl := &fakeLedger{}
+	deps.ledger = fl
+
+	doChatRequest(t, deps, `{"model":"fast","messages":[{"role":"user","content":"hi"}]}`)
+
+	if len(fl.entries) != 0 {
+		t.Errorf("ledger entries recorded = %d, want 0 (a total failure has no usage to attribute)", len(fl.entries))
 	}
 }
 
@@ -442,7 +574,10 @@ func parseSSE(t *testing.T, body string) []sseEvent {
 
 func TestHandleChatCompletions_Streaming_Success(t *testing.T) {
 	p := mock.New("mock-provider", time.Millisecond, 0, 0)
+	p.SetPricing(2, 4)
 	deps := testDepsWithProvider(t, "mock-provider", p)
+	fl := &fakeLedger{}
+	deps.ledger = fl
 
 	rec := doChatRequest(t, deps, `{"model":"fast","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
 
@@ -508,6 +643,21 @@ func TestHandleChatCompletions_Streaming_Success(t *testing.T) {
 	if limiter.lastDelta != wantCost-wantActual {
 		t.Errorf("last Adjust delta = %d, want %d", limiter.lastDelta, wantCost-wantActual)
 	}
+
+	if len(fl.entries) != 1 {
+		t.Fatalf("ledger entries recorded = %d, want 1", len(fl.entries))
+	}
+	e := fl.entries[0]
+	if e.Provider != "mock-provider" || e.Model != "mock-model-v1" {
+		t.Errorf("Provider/Model = %q/%q, want %q/%q", e.Provider, e.Model, "mock-provider", "mock-model-v1")
+	}
+	if e.PromptTokens != 2 || e.CompletionTokens != 4 {
+		t.Errorf("token counts = (%d, %d), want (2, 4) from the provider's own final usage", e.PromptTokens, e.CompletionTokens)
+	}
+	wantCostUSD := float64(2)/1e6*2 + float64(4)/1e6*4
+	if e.CostUSD != wantCostUSD {
+		t.Errorf("CostUSD = %v, want %v", e.CostUSD, wantCostUSD)
+	}
 }
 
 func TestHandleChatCompletions_Streaming_PreFlushFailureFallsOverAndStillStreams(t *testing.T) {
@@ -548,7 +698,10 @@ func TestHandleChatCompletions_Streaming_PreFlushFailureFallsOverAndStillStreams
 func TestHandleChatCompletions_Streaming_MidStreamFailureTerminatesWithErrorEvent(t *testing.T) {
 	primary := mock.New("primary", 0, 0, 0)
 	primary.FailMidStream(2, 500)
+	primary.SetPricing(2, 4)
 	deps := testDepsWithProvider(t, "primary", primary)
+	fl := &fakeLedger{}
+	deps.ledger = fl
 
 	rec := doChatRequest(t, deps, `{"model":"fast","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
 
@@ -584,6 +737,21 @@ func TestHandleChatCompletions_Streaming_MidStreamFailureTerminatesWithErrorEven
 	wantCost := int64(10) + 512
 	if limiter.lastDelta != wantCost-wantActual {
 		t.Errorf("last Adjust delta = %d, want %d (charge for partial generation, refund the rest of the estimate)", limiter.lastDelta, wantCost-wantActual)
+	}
+
+	if len(fl.entries) != 1 {
+		t.Fatalf("ledger entries recorded = %d, want 1 (a partial stream still gets a row, charged for what was actually generated)", len(fl.entries))
+	}
+	e := fl.entries[0]
+	if e.PromptTokens != 10 || e.CompletionTokens != 2 {
+		t.Errorf("token counts = (%d, %d), want (10, 2)", e.PromptTokens, e.CompletionTokens)
+	}
+	wantCostUSD := float64(10)/1e6*2 + float64(2)/1e6*4
+	if e.CostUSD != wantCostUSD {
+		t.Errorf("CostUSD = %v, want %v", e.CostUSD, wantCostUSD)
+	}
+	if e.StatusCode != http.StatusOK {
+		t.Errorf("StatusCode = %d, want 200 (the wire-level status already committed)", e.StatusCode)
 	}
 }
 

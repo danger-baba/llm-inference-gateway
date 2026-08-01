@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Pinger is satisfied by any dependency /readyz must check. The gateway's
@@ -19,11 +21,13 @@ func newMux(redis, postgres Pinger, chat chatDeps, resolver identityResolver, ad
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealthz)
 	mux.HandleFunc("/readyz", handleReadyz(redis, postgres))
+	mux.Handle("/metrics", promhttp.Handler())
 	mux.Handle("/v1/chat/completions", withBearerAuth(resolver, handleChatCompletions(chat)))
 	mux.HandleFunc("/v1/models", handleModels(chat.router.Aliases()))
 	mux.HandleFunc("POST /admin/keys", handleIssueKey(admin))
 	mux.HandleFunc("DELETE /admin/keys/{id}", handleRevokeKey(admin))
 	mux.HandleFunc("POST /admin/cache/purge", handlePurgeCache(admin))
+	mux.HandleFunc("GET /admin/usage", handleUsage(admin))
 	return mux
 }
 

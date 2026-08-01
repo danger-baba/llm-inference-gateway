@@ -12,6 +12,7 @@ import (
 	"github.com/danger-baba/llm-inference-gateway/internal/cache/exact"
 	"github.com/danger-baba/llm-inference-gateway/internal/cache/semantic"
 	"github.com/danger-baba/llm-inference-gateway/internal/embedding"
+	"github.com/danger-baba/llm-inference-gateway/internal/ledger"
 	"github.com/danger-baba/llm-inference-gateway/internal/retry"
 	"github.com/danger-baba/llm-inference-gateway/internal/router"
 )
@@ -46,6 +47,16 @@ type Options struct {
 	// "disable this tier and continue with Tier-1" failure mode.
 	Embedder      *embedding.Embedder
 	SemanticCache *semantic.Store
+
+	// Ledger and UsageAggregator are nil when Postgres isn't configured --
+	// usage simply isn't recorded/queryable in that case, matching every
+	// other Postgres-optional dependency in this struct.
+	Ledger          *ledger.Writer
+	UsageAggregator *ledger.PGAggregator
+	// LogRequestBodies gates a separate, explicit debug-level log of
+	// prompt/response content -- off by default, since prompts contain
+	// user data (README, Observability).
+	LogRequestBodies bool
 }
 
 type Server struct {
@@ -79,6 +90,15 @@ func New(opts Options) (*Server, error) {
 		embedderIface = opts.Embedder
 		semanticIface = opts.SemanticCache
 	}
+	var ledgerIface ledgerRecorder
+	if opts.Ledger != nil {
+		ledgerIface = opts.Ledger
+	}
+
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 
 	chat := chatDeps{
 		router:                   opts.Router,
@@ -91,17 +111,25 @@ func New(opts Options) (*Server, error) {
 		cacheNonzeroTemperature:  opts.CacheNonzeroTemperature,
 		embedder:                 embedderIface,
 		semanticCache:            semanticIface,
+		ledger:                   ledgerIface,
+		logger:                   logger,
+		logRequestBodies:         opts.LogRequestBodies,
+	}
+	var usageIface usageAggregator
+	if opts.UsageAggregator != nil {
+		usageIface = opts.UsageAggregator
 	}
 	admin := adminDeps{
 		issuer:      opts.AuthStore,
 		revoker:     opts.AuthStore,
 		invalidator: opts.AuthResolver,
 		purger:      purgerIface,
+		usage:       usageIface,
 	}
 	mux := newMux(opts.Redis, opts.Postgres, chat, opts.AuthResolver, admin)
-	handler := withRequestID(withRequestTimeout(opts.RequestTimeout, withMaxBody(opts.MaxBodyBytes, mux)))
+	handler := withRequestID(withRequestLogging(logger, withRequestTimeout(opts.RequestTimeout, withMaxBody(opts.MaxBodyBytes, mux))))
 
-	return newServer(ln, handler, opts.ReadTimeout, opts.ShutdownTimeout, opts.Logger), nil
+	return newServer(ln, handler, opts.ReadTimeout, opts.ShutdownTimeout, logger), nil
 }
 
 func newServer(ln net.Listener, handler http.Handler, readTimeout, shutdownTimeout time.Duration, logger *slog.Logger) *Server {

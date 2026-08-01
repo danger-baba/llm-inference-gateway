@@ -19,6 +19,7 @@ import (
 	"github.com/danger-baba/llm-inference-gateway/internal/cache/semantic"
 	"github.com/danger-baba/llm-inference-gateway/internal/config"
 	"github.com/danger-baba/llm-inference-gateway/internal/embedding"
+	"github.com/danger-baba/llm-inference-gateway/internal/ledger"
 	"github.com/danger-baba/llm-inference-gateway/internal/ratelimit"
 	"github.com/danger-baba/llm-inference-gateway/internal/retry"
 	"github.com/danger-baba/llm-inference-gateway/internal/router"
@@ -110,6 +111,13 @@ func run() error {
 		defer embedder.Close()
 	}
 
+	ledgerWriter := ledger.NewWriter(
+		ledger.NewPGInserter(pgPool),
+		cfg.Ledger.BufferSize, cfg.Ledger.BatchSize, cfg.Ledger.FlushInterval.Std(),
+		logger,
+	)
+	usageAggregator := ledger.NewPGAggregator(pgPool)
+
 	srv, err := server.New(server.Options{
 		Addr:                     cfg.Server.Addr,
 		ReadTimeout:              cfg.Server.ReadTimeout.Std(),
@@ -131,6 +139,9 @@ func run() error {
 		CacheNonzeroTemperature:  cfg.Cache.Exact.CacheNonzeroTemperature,
 		Embedder:                 embedder,
 		SemanticCache:            semanticStore,
+		Ledger:                   ledgerWriter,
+		UsageAggregator:          usageAggregator,
+		LogRequestBodies:         cfg.Observability.LogRequestBodies,
 	})
 	if err != nil {
 		return err
@@ -145,6 +156,16 @@ func run() error {
 	go prober.Run(ctx)
 
 	runErr := srv.Run(ctx)
+
+	// Flush the ledger's buffer on the way out, per the README's
+	// concurrency model ("flush the ledger buffer" as part of graceful
+	// shutdown) — after Run returns, so no in-flight request's Record
+	// call races the drain.
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout.Std())
+	if err := ledgerWriter.Close(shutdownCtx); err != nil {
+		logger.Warn("ledger: failed to flush buffered entries on shutdown", "error", err)
+	}
+	cancelShutdown()
 
 	// Persist the semantic index on the way out, per the README's
 	// concurrency model ("persist the HNSW index" as part of graceful

@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/danger-baba/llm-inference-gateway/internal/auth"
+	"github.com/danger-baba/llm-inference-gateway/internal/ledger"
 )
 
 // keyIssuer, keyRevoker, and cacheInvalidator are narrow interfaces so
@@ -32,11 +34,19 @@ type cachePurger interface {
 	PurgeTenant(ctx context.Context, tenantID string) (int, error)
 }
 
+// usageAggregator is satisfied by *ledger.PGAggregator; nil when
+// Postgres isn't configured, in which case GET /admin/usage reports 503
+// rather than pretending to have an answer.
+type usageAggregator interface {
+	Aggregate(ctx context.Context, scope ledger.Scope, id uuid.UUID, since, until time.Time) (ledger.UsageAggregate, error)
+}
+
 type adminDeps struct {
 	issuer      keyIssuer
 	revoker     keyRevoker
 	invalidator cacheInvalidator
 	purger      cachePurger
+	usage       usageAggregator
 }
 
 type issueKeyRequest struct {
@@ -150,5 +160,77 @@ func handlePurgeCache(deps adminDeps) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(purgeCacheResponse{Deleted: deleted})
+	}
+}
+
+type usageResponse struct {
+	Scope            string           `json:"scope"`
+	ID               string           `json:"id"`
+	Since            time.Time        `json:"since"`
+	Until            time.Time        `json:"until"`
+	Requests         int64            `json:"requests"`
+	PromptTokens     int64            `json:"prompt_tokens"`
+	CompletionTokens int64            `json:"completion_tokens"`
+	TokensSaved      int64            `json:"tokens_saved"`
+	CostUSD          float64          `json:"cost_usd"`
+	CacheHits        map[string]int64 `json:"cache_hits"`
+}
+
+// handleUsage answers GET /admin/usage?scope=org|team|key&id=<uuid>&since=<RFC3339>&until=<RFC3339>.
+// since/until default to the last 24 hours ending now when omitted, so a
+// bare `?scope=org&id=...` request still returns something useful.
+func handleUsage(deps adminDeps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if deps.usage == nil {
+			writeJSONError(w, r, http.StatusServiceUnavailable, "usage aggregation requires Postgres, which is not configured")
+			return
+		}
+
+		q := r.URL.Query()
+		scope := ledger.Scope(q.Get("scope"))
+		if !ledger.ValidScope(scope) {
+			writeJSONError(w, r, http.StatusBadRequest, fmt.Sprintf("scope must be one of org, team, key (got %q)", scope))
+			return
+		}
+		id, err := uuid.Parse(q.Get("id"))
+		if err != nil {
+			writeJSONError(w, r, http.StatusBadRequest, "id must be a valid UUID")
+			return
+		}
+
+		until := time.Now().UTC()
+		if raw := q.Get("until"); raw != "" {
+			until, err = time.Parse(time.RFC3339, raw)
+			if err != nil {
+				writeJSONError(w, r, http.StatusBadRequest, "until must be RFC3339")
+				return
+			}
+		}
+		since := until.Add(-24 * time.Hour)
+		if raw := q.Get("since"); raw != "" {
+			since, err = time.Parse(time.RFC3339, raw)
+			if err != nil {
+				writeJSONError(w, r, http.StatusBadRequest, "since must be RFC3339")
+				return
+			}
+		}
+		if !since.Before(until) {
+			writeJSONError(w, r, http.StatusBadRequest, "since must be before until")
+			return
+		}
+
+		agg, err := deps.usage.Aggregate(r.Context(), scope, id, since, until)
+		if err != nil {
+			writeJSONError(w, r, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(usageResponse{
+			Scope: string(scope), ID: id.String(), Since: since, Until: until,
+			Requests: agg.Requests, PromptTokens: agg.PromptTokens, CompletionTokens: agg.CompletionTokens,
+			TokensSaved: agg.TokensSaved, CostUSD: agg.CostUSD, CacheHits: agg.CacheHits,
+		})
 	}
 }

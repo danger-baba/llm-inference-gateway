@@ -6,7 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/danger-baba/llm-inference-gateway/internal/breaker"
+	"github.com/danger-baba/llm-inference-gateway/internal/metrics"
 	"github.com/danger-baba/llm-inference-gateway/internal/providers"
 	"github.com/danger-baba/llm-inference-gateway/internal/providers/mock"
 	"github.com/danger-baba/llm-inference-gateway/internal/router"
@@ -59,6 +63,88 @@ func TestExecute_SuccessOnFirstTry(t *testing.T) {
 	if len(result.Attempts) != 1 || result.Attempts[0].Status != 200 {
 		t.Errorf("Attempts = %+v, want a single 200", result.Attempts)
 	}
+}
+
+func TestExecute_ResultCarriesModelAndProviderDuration(t *testing.T) {
+	reg := breaker.NewRegistry(lenientBreakerConfig())
+	p := mock.New("model-duration-provider", 5*time.Millisecond, 0, 0)
+	e := New(reg, map[string]providers.Provider{"model-duration-provider": p},
+		map[string]time.Duration{"model-duration-provider": time.Second}, fastRetryConfig())
+
+	result, err := e.Execute(context.Background(), []router.Tier{singleTier("model-duration-provider", 1)}, testReq())
+	if err != nil {
+		t.Fatalf("Execute() unexpected error: %v", err)
+	}
+	if result.Model != "m" {
+		t.Errorf("Model = %q, want %q (the candidate's vendor model string)", result.Model, "m")
+	}
+	if result.ProviderDuration < 5*time.Millisecond {
+		t.Errorf("ProviderDuration = %v, want at least the injected 5ms latency", result.ProviderDuration)
+	}
+}
+
+func TestExecute_RecordsProviderDurationAndRetriesMetrics(t *testing.T) {
+	reg := breaker.NewRegistry(lenientBreakerConfig())
+	primary := mock.New("metrics-primary", 0, 1, 429) // Retryable, fails twice then falls over
+	secondary := mock.New("metrics-secondary", 0, 0, 0)
+	provs := map[string]providers.Provider{"metrics-primary": primary, "metrics-secondary": secondary}
+	timeouts := map[string]time.Duration{"metrics-primary": time.Second, "metrics-secondary": time.Second}
+	e := New(reg, provs, timeouts, fastRetryConfig())
+
+	retriesBefore := testutil.ToFloat64(metrics.RetriesTotal.WithLabelValues(providers.Retryable.String()))
+
+	tiers := []router.Tier{singleTier("metrics-primary", 1), singleTier("metrics-secondary", 1)}
+	if _, err := e.Execute(context.Background(), tiers, testReq()); err != nil {
+		t.Fatalf("Execute() unexpected error: %v", err)
+	}
+
+	retriesAfter := testutil.ToFloat64(metrics.RetriesTotal.WithLabelValues(providers.Retryable.String()))
+	if got := retriesAfter - retriesBefore; got != 2 {
+		t.Errorf("gateway_retries_total{class=retryable} increased by %v, want 2 (primary's two failed attempts)", got)
+	}
+
+	// gateway_provider_duration_seconds is a histogram, so the
+	// observation count -- not a bucket value -- is the thing to check:
+	// exactly one observation per real provider call made (2 failed on
+	// primary + 1 successful on secondary).
+	if got := histogramSampleCount(t, "metrics-primary", "m"); got != 2 {
+		t.Errorf("gateway_provider_duration_seconds sample count for primary = %d, want 2", got)
+	}
+	if got := histogramSampleCount(t, "metrics-secondary", "m"); got != 1 {
+		t.Errorf("gateway_provider_duration_seconds sample count for secondary = %d, want 1", got)
+	}
+}
+
+// histogramSampleCount reads gateway_provider_duration_seconds's own
+// observation count for one (provider, model) series directly off the
+// default Prometheus registry -- testutil.ToFloat64 only works for
+// single-value collectors (counters/gauges), not histograms.
+func histogramSampleCount(t *testing.T, provider, model string) uint64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("Gather(): %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != "gateway_provider_duration_seconds" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			var gotProvider, gotModel string
+			for _, lp := range m.GetLabel() {
+				switch lp.GetName() {
+				case "provider":
+					gotProvider = lp.GetValue()
+				case "model":
+					gotModel = lp.GetValue()
+				}
+			}
+			if gotProvider == provider && gotModel == model {
+				return m.GetHistogram().GetSampleCount()
+			}
+		}
+	}
+	return 0
 }
 
 func TestExecute_RetriesRetryableWithinSameProvider(t *testing.T) {

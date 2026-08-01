@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/danger-baba/llm-inference-gateway/internal/breaker"
+	"github.com/danger-baba/llm-inference-gateway/internal/metrics"
 	"github.com/danger-baba/llm-inference-gateway/internal/providers"
 	"github.com/danger-baba/llm-inference-gateway/internal/router"
 )
@@ -38,7 +39,16 @@ func (a Attempt) String() string {
 type Result struct {
 	Response *providers.CanonicalResponse
 	Provider string
+	// Model is the actual vendor model string the winning candidate
+	// used, not the client-facing alias -- what the ledger's cost
+	// computation needs, since pricing is per real model, not per alias.
+	Model    string
 	Attempts []Attempt
+	// ProviderDuration is summed across every attempt this call made
+	// (including failed ones before the winning candidate, if any), so
+	// callers can compute gateway_proxy_overhead_seconds as their own
+	// total latency minus this.
+	ProviderDuration time.Duration
 }
 
 // Error wraps the terminal cause of a failed Execute call together with
@@ -75,6 +85,7 @@ func New(breakers *breaker.Registry, provs map[string]providers.Provider, provid
 // left in the tier before moving on to the next one.
 func (e *Engine) Execute(ctx context.Context, tiers []router.Tier, req *providers.CanonicalRequest) (*Result, error) {
 	var attempts []Attempt
+	var providerDuration time.Duration
 	var lastErr error = ErrNoHealthyProvider
 
 	for _, tier := range tiers {
@@ -86,9 +97,12 @@ func (e *Engine) Execute(ctx context.Context, tiers []router.Tier, req *provider
 			}
 			tried[candidate.ProviderName] = true
 
-			resp, status, err := e.tryCandidate(ctx, candidate, req, &attempts)
+			resp, status, err := e.tryCandidate(ctx, candidate, req, &attempts, &providerDuration)
 			if err == nil {
-				return &Result{Response: resp, Provider: candidate.ProviderName, Attempts: attempts}, nil
+				return &Result{
+					Response: resp, Provider: candidate.ProviderName, Model: candidate.Model,
+					Attempts: attempts, ProviderDuration: providerDuration,
+				}, nil
 			}
 			if errors.Is(err, errBreakerRejected) {
 				continue // never counted as an attempt; try someone else in the tier
@@ -114,7 +128,7 @@ func (e *Engine) Execute(ctx context.Context, tiers []router.Tier, req *provider
 // MaxAttemptsPerProvider tries, full-jitter backoff between them (or
 // Retry-After when the provider sent one), stopping the moment a failure
 // isn't classified Retryable.
-func (e *Engine) tryCandidate(ctx context.Context, c router.Candidate, req *providers.CanonicalRequest, attempts *[]Attempt) (*providers.CanonicalResponse, int, error) {
+func (e *Engine) tryCandidate(ctx context.Context, c router.Candidate, req *providers.CanonicalRequest, attempts *[]Attempt, totalProviderDuration *time.Duration) (*providers.CanonicalResponse, int, error) {
 	provider := e.providers[c.ProviderName]
 	br := e.breakers.Get(c.ProviderName, c.Model)
 
@@ -142,8 +156,13 @@ func (e *Engine) tryCandidate(ctx context.Context, c router.Candidate, req *prov
 		}
 
 		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout(ctx, e.providerTimeout[c.ProviderName]))
+		callStart := time.Now()
 		resp, err := provider.Complete(attemptCtx, &providerReq)
+		callDuration := time.Since(callStart)
 		cancel()
+
+		*totalProviderDuration += callDuration
+		metrics.ProviderDuration.WithLabelValues(c.ProviderName, c.Model).Observe(callDuration.Seconds())
 
 		if err == nil {
 			br.RecordSuccess()
@@ -159,6 +178,7 @@ func (e *Engine) tryCandidate(ctx context.Context, c router.Candidate, req *prov
 		*attempts = append(*attempts, Attempt{Provider: c.ProviderName, Status: status})
 
 		class := provider.Classify(err, status)
+		metrics.RetriesTotal.WithLabelValues(class.String()).Inc()
 		if class != providers.Terminal {
 			br.RecordFailure() // Retryable and Fallback both count against provider health.
 		}
@@ -177,8 +197,12 @@ func (e *Engine) tryCandidate(ctx context.Context, c router.Candidate, req *prov
 // (nil if it never sent one — see providers.Delta's doc comment).
 type StreamResult struct {
 	Provider string
-	Attempts []Attempt
-	Usage    *providers.Usage
+	// Model is the actual vendor model string the winning candidate
+	// used -- see Result.Model's doc comment.
+	Model            string
+	Attempts         []Attempt
+	Usage            *providers.Usage
+	ProviderDuration time.Duration
 }
 
 // StreamError is Error's streaming counterpart. Flushed records whether
@@ -206,8 +230,9 @@ func (e *StreamError) Unwrap() error { return e.Err }
 // providers' output into one response would be silently wrong, not
 // merely imperfect. It instead returns immediately with Flushed: true so
 // the caller can end the stream with an explicit error event.
-func (e *Engine) ExecuteStream(ctx context.Context, tiers []router.Tier, req *providers.CanonicalRequest, onDelta func(providerName string, d providers.Delta) error) (*StreamResult, error) {
+func (e *Engine) ExecuteStream(ctx context.Context, tiers []router.Tier, req *providers.CanonicalRequest, onDelta func(providerName, model string, d providers.Delta) error) (*StreamResult, error) {
 	var attempts []Attempt
+	var providerDuration time.Duration
 	var lastErr error = ErrNoHealthyProvider
 
 	for _, tier := range tiers {
@@ -219,9 +244,12 @@ func (e *Engine) ExecuteStream(ctx context.Context, tiers []router.Tier, req *pr
 			}
 			tried[candidate.ProviderName] = true
 
-			usage, flushed, status, err := e.tryCandidateStream(ctx, candidate, req, onDelta, &attempts)
+			usage, flushed, status, err := e.tryCandidateStream(ctx, candidate, req, onDelta, &attempts, &providerDuration)
 			if err == nil {
-				return &StreamResult{Provider: candidate.ProviderName, Attempts: attempts, Usage: usage}, nil
+				return &StreamResult{
+					Provider: candidate.ProviderName, Model: candidate.Model,
+					Attempts: attempts, Usage: usage, ProviderDuration: providerDuration,
+				}, nil
 			}
 			if errors.Is(err, errBreakerRejected) {
 				continue
@@ -250,7 +278,7 @@ func (e *Engine) ExecuteStream(ctx context.Context, tiers []router.Tier, req *pr
 // (including from a later attempt of the same candidate) is returned
 // immediately rather than retried, since content already reached the
 // client.
-func (e *Engine) tryCandidateStream(ctx context.Context, c router.Candidate, req *providers.CanonicalRequest, onDelta func(string, providers.Delta) error, attempts *[]Attempt) (*providers.Usage, bool, int, error) {
+func (e *Engine) tryCandidateStream(ctx context.Context, c router.Candidate, req *providers.CanonicalRequest, onDelta func(string, string, providers.Delta) error, attempts *[]Attempt, totalProviderDuration *time.Duration) (*providers.Usage, bool, int, error) {
 	provider := e.providers[c.ProviderName]
 	br := e.breakers.Get(c.ProviderName, c.Model)
 
@@ -274,11 +302,16 @@ func (e *Engine) tryCandidateStream(ctx context.Context, c router.Candidate, req
 		}
 
 		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout(ctx, e.providerTimeout[c.ProviderName]))
-		usage, attemptFlushed, err := e.relayStream(attemptCtx, provider, &providerReq, c.ProviderName, onDelta)
+		callStart := time.Now()
+		usage, attemptFlushed, err := e.relayStream(attemptCtx, provider, &providerReq, c.ProviderName, c.Model, onDelta)
+		callDuration := time.Since(callStart)
 		cancel()
 		if attemptFlushed {
 			flushed = true
 		}
+
+		*totalProviderDuration += callDuration
+		metrics.ProviderDuration.WithLabelValues(c.ProviderName, c.Model).Observe(callDuration.Seconds())
 
 		if err == nil {
 			br.RecordSuccess()
@@ -300,6 +333,7 @@ func (e *Engine) tryCandidateStream(ctx context.Context, c router.Candidate, req
 		}
 
 		class := provider.Classify(err, status)
+		metrics.RetriesTotal.WithLabelValues(class.String()).Inc()
 		if class != providers.Terminal {
 			br.RecordFailure()
 		}
@@ -317,7 +351,7 @@ func (e *Engine) tryCandidateStream(ctx context.Context, c router.Candidate, req
 // implementation leaves channel lifecycle to its caller), so relayStream
 // owns that here: it closes the provider-facing channel once Stream
 // returns and only then reports Stream's own error.
-func (e *Engine) relayStream(ctx context.Context, provider providers.Provider, req *providers.CanonicalRequest, providerName string, onDelta func(string, providers.Delta) error) (*providers.Usage, bool, error) {
+func (e *Engine) relayStream(ctx context.Context, provider providers.Provider, req *providers.CanonicalRequest, providerName, model string, onDelta func(string, string, providers.Delta) error) (*providers.Usage, bool, error) {
 	providerChan := make(chan providers.Delta)
 	errCh := make(chan error, 1)
 	go func() {
@@ -332,7 +366,7 @@ func (e *Engine) relayStream(ctx context.Context, provider providers.Provider, r
 		if delta.Usage != nil {
 			usage = delta.Usage
 		}
-		if err := onDelta(providerName, delta); err != nil {
+		if err := onDelta(providerName, model, delta); err != nil {
 			// Drain so the goroutine above never blocks on a send nobody
 			// will receive; its own Stream call will still return on its
 			// own terms (every implementation selects on ctx being done).
@@ -346,6 +380,18 @@ func (e *Engine) relayStream(ctx context.Context, provider providers.Provider, r
 		}
 	}
 	return usage, flushed, <-errCh
+}
+
+// Pricing looks up a provider's per-model USD price, for callers (the
+// ledger) that only see a Result/StreamResult's Provider/Model strings
+// and have no other way to reach the concrete provider instance the
+// engine already holds.
+func (e *Engine) Pricing(providerName, model string) (inPerMTok, outPerMTok float64) {
+	p, ok := e.providers[providerName]
+	if !ok {
+		return 0, 0
+	}
+	return p.Pricing(model)
 }
 
 // pickFromTier weighted-selects among candidates not yet tried this
