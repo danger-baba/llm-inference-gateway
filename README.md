@@ -24,7 +24,7 @@ piece already exists.
 | 2 | Provider abstraction (mock/OpenAI/Anthropic), first proxy hop | ✅ Done |
 | 3 | Circuit breaker, retry, fallback | ✅ Done |
 | 4 | Auth, tenants, Postgres migrations | ✅ Done (admin API auth is a known gap — see Known Limitations) |
-| 5 | Token-aware rate limiter | ⏳ Planned |
+| 5 | Token-aware rate limiter | ✅ Done |
 | 6 | Exact-match cache | ⏳ Planned |
 | 7 | Semantic cache | ⏳ Planned |
 | 8 | Streaming (SSE) | ⏳ Planned |
@@ -873,6 +873,13 @@ README can do.
    its tier with no explicit `weight:` set becomes completely undialable (Go's int zero
    value collides with the deliberate "drain this provider" signal), and the resulting error
    is indistinguishable from a real outage. Always set `weight` explicitly. See `docs/adr/0006`.
+10. **Prompt token counts use OpenAI's tokenizer for every provider, including Anthropic.**
+    Self-correcting within a request via reserve-then-reconcile, but not exact. See `docs/adr/0009`.
+11. **The tokenizer needs network access on first startup** to fetch its BPE rank file,
+    unless `TIKTOKEN_CACHE_DIR` points at a pre-populated cache. A gateway meant to survive
+    provider outages currently can't finish starting up fully air-gapped. See `docs/adr/0009`.
+12. **A TPM limit changed in Postgres takes up to 5 minutes to take effect**, the same
+    staleness window as every other identity field cached at `vk:{sha256}`.
 
 ## Roadmap
 

@@ -28,6 +28,11 @@ type Options struct {
 
 	AuthStore    *auth.Store
 	AuthResolver *auth.CachingResolver
+
+	TokenCounter             tokenCounter
+	RateLimiter              rateLimiter
+	DefaultTPM               int64
+	EstimateCompletionTokens int64
 }
 
 type Server struct {
@@ -46,8 +51,12 @@ func New(opts Options) (*Server, error) {
 	}
 
 	chat := chatDeps{
-		router: opts.Router,
-		engine: opts.Engine,
+		router:                   opts.Router,
+		engine:                   opts.Engine,
+		counter:                  opts.TokenCounter,
+		limiter:                  opts.RateLimiter,
+		defaultTPM:               opts.DefaultTPM,
+		estimateCompletionTokens: opts.EstimateCompletionTokens,
 	}
 	admin := adminDeps{
 		issuer:      opts.AuthStore,

@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 // identityResolver is satisfied by *Store; CachingResolver depends on
@@ -14,15 +12,14 @@ type identityResolver interface {
 	Resolve(ctx context.Context, hash []byte) (Identity, bool, error)
 }
 
-// cachedEntry is the JSON shape stored at vk:{sha256}. Revoked is cached
-// too — resolving a revoked key hits the cache and gets ErrRevoked
+// cachedEntry is the JSON shape stored at vk:{sha256}: the full Identity
+// (including the TPM limits the rate limiter needs, so it never has to
+// re-query Postgres for them) plus whether the key is revoked. Revoked is
+// cached too — resolving a revoked key hits the cache and gets ErrRevoked
 // instead of round-tripping to Postgres on every request for it.
 type cachedEntry struct {
-	OrgID         uuid.UUID `json:"org_id"`
-	TeamID        uuid.UUID `json:"team_id"`
-	KeyID         uuid.UUID `json:"key_id"`
-	AllowedModels []string  `json:"allowed_models"`
-	Revoked       bool      `json:"revoked"`
+	Identity
+	Revoked bool `json:"revoked"`
 }
 
 // CachingResolver resolves a presented plaintext key to an Identity,
@@ -48,12 +45,7 @@ func (c *CachingResolver) Resolve(ctx context.Context, plaintextKey string) (Ide
 			if entry.Revoked {
 				return Identity{}, ErrRevoked
 			}
-			return Identity{
-				OrgID:         entry.OrgID,
-				TeamID:        entry.TeamID,
-				KeyID:         entry.KeyID,
-				AllowedModels: entry.AllowedModels,
-			}, nil
+			return entry.Identity, nil
 		}
 		// Corrupt cache entry: fall through and resolve from Postgres.
 	}
@@ -63,7 +55,7 @@ func (c *CachingResolver) Resolve(ctx context.Context, plaintextKey string) (Ide
 		return Identity{}, err // ErrNotFound, or a real failure — nothing to cache either way
 	}
 
-	entry := cachedEntry{OrgID: id.OrgID, TeamID: id.TeamID, KeyID: id.KeyID, AllowedModels: id.AllowedModels, Revoked: revoked}
+	entry := cachedEntry{Identity: id, Revoked: revoked}
 	if payload, jsonErr := json.Marshal(entry); jsonErr == nil {
 		// Best-effort: a cache write failure shouldn't fail the request
 		// that triggered it, only cost the next request a Postgres round trip.

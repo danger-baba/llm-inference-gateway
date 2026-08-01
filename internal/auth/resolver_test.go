@@ -72,6 +72,30 @@ func TestCachingResolver_ResolvesFromStoreOnCacheMiss(t *testing.T) {
 	}
 }
 
+func TestCachingResolver_TPMLimitsSurviveCacheRoundTrip(t *testing.T) {
+	keyLimit := int64(1000)
+	id := Identity{
+		OrgID: uuid.New(), TeamID: uuid.New(), KeyID: uuid.New(),
+		OrgTPMLimit: 200000, TeamTPMLimit: 50000, KeyTPMLimit: &keyLimit,
+	}
+	store := &fakeResolver{identity: id}
+	c := NewCachingResolver(newFakeCache(), store, time.Minute)
+
+	if _, err := c.Resolve(context.Background(), "sk-vk-plaintext"); err != nil {
+		t.Fatalf("first Resolve() unexpected error: %v", err)
+	}
+	got, err := c.Resolve(context.Background(), "sk-vk-plaintext") // from cache this time
+	if err != nil {
+		t.Fatalf("second Resolve() unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(got, id) {
+		t.Errorf("Resolve() from cache = %+v, want %+v", got, id)
+	}
+	if store.calls != 1 {
+		t.Errorf("store.calls = %d, want 1 (second call should hit cache)", store.calls)
+	}
+}
+
 func TestCachingResolver_SecondCallHitsCacheNotStore(t *testing.T) {
 	id := Identity{OrgID: uuid.New(), TeamID: uuid.New(), KeyID: uuid.New()}
 	store := &fakeResolver{identity: id}

@@ -43,6 +43,9 @@ retry:
   max_attempts_per_provider: 2
   base_backoff: 200ms
   max_backoff: 5s
+rate_limit:
+  default_tpm: 200000
+  estimate_completion_tokens: 512
 observability:
   log_level: info
 `
@@ -114,6 +117,9 @@ retry:
   max_attempts_per_provider: 2
   base_backoff: 200ms
   max_backoff: 5s
+rate_limit:
+  default_tpm: 200000
+  estimate_completion_tokens: 512
 observability:
   log_level: info
 `,
@@ -156,6 +162,9 @@ retry:
   max_attempts_per_provider: 2
   base_backoff: 200ms
   max_backoff: 5s
+rate_limit:
+  default_tpm: 200000
+  estimate_completion_tokens: 512
 observability:
   log_level: info
 `
@@ -195,6 +204,9 @@ retry:
   max_attempts_per_provider: 0
   base_backoff: 0s
   max_backoff: 0s
+rate_limit:
+  default_tpm: 0
+  estimate_completion_tokens: -1
 observability:
   log_level: "not-a-level"
 `
@@ -222,6 +234,8 @@ observability:
 		"breaker.prober_interval",
 		"retry.max_attempts_per_provider",
 		"retry.base_backoff",
+		"rate_limit.default_tpm",
+		"rate_limit.estimate_completion_tokens",
 		"observability.log_level",
 	}
 	msg := err.Error()

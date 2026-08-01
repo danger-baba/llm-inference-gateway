@@ -8,6 +8,16 @@ on:
 jobs:
   build-test-lint:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 
@@ -23,6 +33,8 @@ jobs:
 
       - name: test -race
         run: go test ./... -race
+        env:
+          RATELIMIT_TEST_REDIS_ADDR: localhost:6379
 
       - name: lint
         uses: golangci/golangci-lint-action@v6

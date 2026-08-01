@@ -16,9 +16,11 @@ import (
 	"github.com/danger-baba/llm-inference-gateway/internal/auth"
 	"github.com/danger-baba/llm-inference-gateway/internal/breaker"
 	"github.com/danger-baba/llm-inference-gateway/internal/config"
+	"github.com/danger-baba/llm-inference-gateway/internal/ratelimit"
 	"github.com/danger-baba/llm-inference-gateway/internal/retry"
 	"github.com/danger-baba/llm-inference-gateway/internal/router"
 	"github.com/danger-baba/llm-inference-gateway/internal/server"
+	"github.com/danger-baba/llm-inference-gateway/internal/tokenizer"
 )
 
 // identityCacheTTL matches the README's Redis key layout table
@@ -84,19 +86,29 @@ func run() error {
 	authStore := auth.NewStore(pgPool)
 	authResolver := auth.NewCachingResolver(auth.NewRedisCache(redisClient), authStore, identityCacheTTL)
 
+	tokenCounter, err := tokenizer.New()
+	if err != nil {
+		return err
+	}
+	rateLimiter := ratelimit.New(redisClient, cfg.RateLimit.FailOpen)
+
 	srv, err := server.New(server.Options{
-		Addr:            cfg.Server.Addr,
-		ReadTimeout:     cfg.Server.ReadTimeout.Std(),
-		RequestTimeout:  cfg.Server.RequestTimeout.Std(),
-		MaxBodyBytes:    cfg.Server.MaxBodyBytes,
-		ShutdownTimeout: cfg.Server.ShutdownTimeout.Std(),
-		Redis:           redisPinger{redisClient, cfg.Redis.DialTimeout.Std()},
-		Postgres:        postgresPinger{pgPool, cfg.Postgres.PingTimeout.Std()},
-		Logger:          logger,
-		Router:          router.New(cfg),
-		Engine:          engine,
-		AuthStore:       authStore,
-		AuthResolver:    authResolver,
+		Addr:                     cfg.Server.Addr,
+		ReadTimeout:              cfg.Server.ReadTimeout.Std(),
+		RequestTimeout:           cfg.Server.RequestTimeout.Std(),
+		MaxBodyBytes:             cfg.Server.MaxBodyBytes,
+		ShutdownTimeout:          cfg.Server.ShutdownTimeout.Std(),
+		Redis:                    redisPinger{redisClient, cfg.Redis.DialTimeout.Std()},
+		Postgres:                 postgresPinger{pgPool, cfg.Postgres.PingTimeout.Std()},
+		Logger:                   logger,
+		Router:                   router.New(cfg),
+		Engine:                   engine,
+		AuthStore:                authStore,
+		AuthResolver:             authResolver,
+		TokenCounter:             tokenCounter,
+		RateLimiter:              rateLimiter,
+		DefaultTPM:               cfg.RateLimit.DefaultTPM,
+		EstimateCompletionTokens: int64(cfg.RateLimit.EstimateCompletionTokens),
 	})
 	if err != nil {
 		return err

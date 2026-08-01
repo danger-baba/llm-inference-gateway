@@ -76,14 +76,17 @@ func (s *Store) RevokeKey(ctx context.Context, id uuid.UUID) ([]byte, error) {
 // "revoked" the same as "never existed."
 func (s *Store) Resolve(ctx context.Context, hash []byte) (id Identity, revoked bool, err error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT vk.id, vk.team_id, t.org_id, vk.allowed_models, vk.revoked_at
+		SELECT vk.id, vk.team_id, t.org_id, vk.allowed_models, vk.revoked_at,
+		       o.tpm_limit, t.tpm_limit, vk.tpm_limit
 		FROM virtual_keys vk
 		JOIN teams t ON t.id = vk.team_id
+		JOIN orgs o ON o.id = t.org_id
 		WHERE vk.key_hash = $1
 	`, hash)
 
 	var revokedAt *time.Time
-	if err := row.Scan(&id.KeyID, &id.TeamID, &id.OrgID, &id.AllowedModels, &revokedAt); err != nil {
+	if err := row.Scan(&id.KeyID, &id.TeamID, &id.OrgID, &id.AllowedModels, &revokedAt,
+		&id.OrgTPMLimit, &id.TeamTPMLimit, &id.KeyTPMLimit); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Identity{}, false, ErrNotFound
 		}

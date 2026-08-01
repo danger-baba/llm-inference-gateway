@@ -8,12 +8,18 @@ import (
 )
 
 // Identity is what a resolved virtual key means for the rest of the
-// gateway: which org/team it belongs to, and which key was actually used.
+// gateway: which org/team it belongs to, which key was actually used, and
+// the token-per-minute ceilings the rate limiter checks at each level.
+// KeyTPMLimit is nil when the key has no override, meaning "use the
+// gateway's configured default_tpm."
 type Identity struct {
 	OrgID         uuid.UUID
 	TeamID        uuid.UUID
 	KeyID         uuid.UUID
 	AllowedModels []string
+	OrgTPMLimit   int64
+	TeamTPMLimit  int64
+	KeyTPMLimit   *int64
 }
 
 var (

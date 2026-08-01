@@ -224,6 +224,23 @@ type CacheConfig struct {
 type RateLimitConfig struct {
 	DefaultTPM               int64 `yaml:"default_tpm"`
 	EstimateCompletionTokens int   `yaml:"estimate_completion_tokens"`
+	// FailOpen isn't in the README's example config, but the README's own
+	// failure-mode table requires this behavior to be "config-switchable."
+	// Defaults to false (fail closed) if omitted, the more conservative
+	// reading; the README's prose leans toward true (availability over
+	// cost control) as the recommended value to set explicitly.
+	FailOpen bool `yaml:"fail_open"`
+}
+
+func (c RateLimitConfig) validate() []error {
+	var errs []error
+	if c.DefaultTPM <= 0 {
+		errs = append(errs, errors.New("rate_limit.default_tpm: must be > 0"))
+	}
+	if c.EstimateCompletionTokens < 0 {
+		errs = append(errs, errors.New("rate_limit.estimate_completion_tokens: must be >= 0"))
+	}
+	return errs
 }
 
 type BatchingConfig struct {
@@ -305,6 +322,7 @@ func (c *Config) Validate() error {
 	}
 	errs = append(errs, c.Breaker.validate()...)
 	errs = append(errs, c.Retry.validate()...)
+	errs = append(errs, c.RateLimit.validate()...)
 	errs = append(errs, c.Observability.validate()...)
 	if len(errs) > 0 {
 		return errors.Join(errs...)
