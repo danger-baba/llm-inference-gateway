@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/danger-baba/llm-inference-gateway/internal/auth"
 	"github.com/danger-baba/llm-inference-gateway/internal/breaker"
+	"github.com/danger-baba/llm-inference-gateway/internal/cache/semantic"
 	"github.com/danger-baba/llm-inference-gateway/internal/config"
 	"github.com/danger-baba/llm-inference-gateway/internal/providers"
 	"github.com/danger-baba/llm-inference-gateway/internal/providers/mock"
@@ -121,6 +123,42 @@ func (f *fakeExactCache) Set(_ context.Context, key string, resp *providers.Cano
 	f.setCalls++
 	f.data[key] = resp
 	return nil
+}
+
+// fakeEmbedder returns a fixed vector for any text: real similarity
+// behavior is covered by internal/embedding's tests against the actual
+// ONNX model, so this only needs to prove the handler wires embed ->
+// semantic-cache-lookup correctly.
+type fakeEmbedder struct {
+	vector    []float32
+	err       error
+	embedCall int
+}
+
+func (f *fakeEmbedder) Embed(_ string) ([]float32, error) {
+	f.embedCall++
+	return f.vector, f.err
+}
+
+type fakeSemanticCache struct {
+	hitResponse *providers.CanonicalResponse
+	hit         bool
+	getCalls    int
+	setCalls    int
+	lastSetResp *providers.CanonicalResponse
+}
+
+func (f *fakeSemanticCache) Get(_ semantic.Query) (*providers.CanonicalResponse, float32, bool) {
+	f.getCalls++
+	if !f.hit {
+		return nil, 0, false
+	}
+	return f.hitResponse, 0.97, true
+}
+
+func (f *fakeSemanticCache) Set(_ semantic.Query, resp *providers.CanonicalResponse) {
+	f.setCalls++
+	f.lastSetResp = resp
 }
 
 func doChatRequest(t *testing.T, deps chatDeps, body string) *httptest.ResponseRecorder {
@@ -285,6 +323,89 @@ func TestHandleChatCompletions_NonzeroTemperatureNeverCached(t *testing.T) {
 	}
 	if cache.getCalls != 0 || cache.setCalls != 0 {
 		t.Errorf("cache Get/Set calls = %d/%d, want 0/0 (cache must not even be consulted)", cache.getCalls, cache.setCalls)
+	}
+}
+
+func TestHandleChatCompletions_SemanticCacheHit_ReleasesReservationAndSkipsProvider(t *testing.T) {
+	p := mock.New("mock-provider", time.Millisecond, 0, 0)
+	deps := testDepsWithProvider(t, "mock-provider", p)
+	deps.embedder = &fakeEmbedder{vector: []float32{1, 0, 0}}
+	semCache := &fakeSemanticCache{hit: true, hitResponse: &providers.CanonicalResponse{ID: "cached-semantic"}}
+	deps.semanticCache = semCache
+
+	body := `{"model":"fast","temperature":0,"messages":[{"role":"user","content":"How do I reset my password?"}]}`
+	rec := doChatRequest(t, deps, body)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Gateway-Cache"); got != "semantic" {
+		t.Errorf("X-Gateway-Cache = %q, want %q", got, "semantic")
+	}
+	if p.CallCount() != 0 {
+		t.Errorf("CallCount() = %d, want 0 (a semantic hit must not call the provider)", p.CallCount())
+	}
+
+	limiter := deps.limiter.(*fakeRateLimiter)
+	if limiter.adjustCalls != 1 {
+		t.Errorf("Adjust called %d times, want 1 (a semantic hit releases the whole reservation)", limiter.adjustCalls)
+	}
+	if limiter.lastDelta != 10+512 {
+		t.Errorf("last Adjust delta = %d, want the full reservation refunded (%d)", limiter.lastDelta, 10+512)
+	}
+}
+
+func TestHandleChatCompletions_SemanticCacheMiss_StoresOnSuccess(t *testing.T) {
+	p := mock.New("mock-provider", time.Millisecond, 0, 0)
+	deps := testDepsWithProvider(t, "mock-provider", p)
+	deps.embedder = &fakeEmbedder{vector: []float32{1, 0, 0}}
+	semCache := &fakeSemanticCache{hit: false}
+	deps.semanticCache = semCache
+
+	body := `{"model":"fast","temperature":0,"messages":[{"role":"user","content":"How do I reset my password?"}]}`
+	rec := doChatRequest(t, deps, body)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Gateway-Cache"); got != "none" {
+		t.Errorf("X-Gateway-Cache = %q, want %q", got, "none")
+	}
+	if p.CallCount() != 1 {
+		t.Errorf("CallCount() = %d, want 1", p.CallCount())
+	}
+	if semCache.getCalls != 1 {
+		t.Errorf("Get called %d times, want 1", semCache.getCalls)
+	}
+	if semCache.setCalls != 1 {
+		t.Errorf("Set called %d times, want 1 (a miss that succeeds should populate the semantic cache)", semCache.setCalls)
+	}
+}
+
+func TestHandleChatCompletions_SemanticCache_NotConsultedWhenEmbeddingFails(t *testing.T) {
+	p := mock.New("mock-provider", time.Millisecond, 0, 0)
+	deps := testDepsWithProvider(t, "mock-provider", p)
+	deps.embedder = &fakeEmbedder{err: fmt.Errorf("model not loaded")}
+	semCache := &fakeSemanticCache{hit: true, hitResponse: &providers.CanonicalResponse{ID: "should-not-be-served"}}
+	deps.semanticCache = semCache
+
+	body := `{"model":"fast","temperature":0,"messages":[{"role":"user","content":"hi"}]}`
+	rec := doChatRequest(t, deps, body)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Gateway-Cache"); got != "none" {
+		t.Errorf("X-Gateway-Cache = %q, want %q (embedding failed, so this must fall through to the provider)", got, "none")
+	}
+	if p.CallCount() != 1 {
+		t.Errorf("CallCount() = %d, want 1", p.CallCount())
+	}
+	if semCache.getCalls != 0 {
+		t.Errorf("Get called %d times, want 0 (no vector to search with)", semCache.getCalls)
+	}
+	if semCache.setCalls != 0 {
+		t.Errorf("Set called %d times, want 0 (embedding failed for this request, don't cache under a bad/no vector)", semCache.setCalls)
 	}
 }
 

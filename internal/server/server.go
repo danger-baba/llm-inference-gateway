@@ -10,6 +10,8 @@ import (
 
 	"github.com/danger-baba/llm-inference-gateway/internal/auth"
 	"github.com/danger-baba/llm-inference-gateway/internal/cache/exact"
+	"github.com/danger-baba/llm-inference-gateway/internal/cache/semantic"
+	"github.com/danger-baba/llm-inference-gateway/internal/embedding"
 	"github.com/danger-baba/llm-inference-gateway/internal/retry"
 	"github.com/danger-baba/llm-inference-gateway/internal/router"
 )
@@ -38,6 +40,12 @@ type Options struct {
 	// ExactCache is nil when cache.exact.enabled is false.
 	ExactCache              *exact.Store
 	CacheNonzeroTemperature bool
+
+	// Embedder and SemanticCache are nil when cache.semantic.enabled is
+	// false, or when the embedding model failed to load — the README's
+	// "disable this tier and continue with Tier-1" failure mode.
+	Embedder      *embedding.Embedder
+	SemanticCache *semantic.Store
 }
 
 type Server struct {
@@ -65,6 +73,12 @@ func New(opts Options) (*Server, error) {
 		cacheIface = opts.ExactCache
 		purgerIface = opts.ExactCache
 	}
+	var embedderIface embedder
+	var semanticIface semanticCache
+	if opts.Embedder != nil && opts.SemanticCache != nil {
+		embedderIface = opts.Embedder
+		semanticIface = opts.SemanticCache
+	}
 
 	chat := chatDeps{
 		router:                   opts.Router,
@@ -75,6 +89,8 @@ func New(opts Options) (*Server, error) {
 		estimateCompletionTokens: opts.EstimateCompletionTokens,
 		cache:                    cacheIface,
 		cacheNonzeroTemperature:  opts.CacheNonzeroTemperature,
+		embedder:                 embedderIface,
+		semanticCache:            semanticIface,
 	}
 	admin := adminDeps{
 		issuer:      opts.AuthStore,

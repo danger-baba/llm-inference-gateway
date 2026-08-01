@@ -304,6 +304,83 @@ cache:
 	}
 }
 
+func TestValidate_SemanticCacheRules(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{
+			name: "enabled with threshold out of range",
+			yaml: minimalValidConfig + `
+cache:
+  semantic:
+    enabled: true
+    threshold: 1.5
+    max_vectors: 100
+    ttl: 1h
+    hnsw: { m: 16, ef_construction: 200, ef_search: 64 }
+`,
+			wantErr: "cache.semantic.threshold",
+		},
+		{
+			name: "enabled with zero max_vectors",
+			yaml: minimalValidConfig + `
+cache:
+  semantic:
+    enabled: true
+    threshold: 0.95
+    max_vectors: 0
+    ttl: 1h
+    hnsw: { m: 16, ef_construction: 200, ef_search: 64 }
+`,
+			wantErr: "cache.semantic.max_vectors",
+		},
+		{
+			name: "enabled with valid settings",
+			yaml: minimalValidConfig + `
+cache:
+  semantic:
+    enabled: true
+    threshold: 0.95
+    max_vectors: 100
+    ttl: 1h
+    hnsw: { m: 16, ef_construction: 200, ef_search: 64 }
+`,
+			wantErr: "",
+		},
+		{
+			name: "disabled with invalid settings is fine",
+			yaml: minimalValidConfig + `
+cache:
+  semantic:
+    enabled: false
+    threshold: 5
+`,
+			wantErr: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeTemp(t, tt.yaml)
+			_, err := Load(path)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Load() unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Load() expected error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Load() error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidate_ProviderRules(t *testing.T) {
 	tests := []struct {
 		name    string

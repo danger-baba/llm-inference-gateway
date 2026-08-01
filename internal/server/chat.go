@@ -11,15 +11,18 @@ import (
 	"strings"
 
 	"github.com/danger-baba/llm-inference-gateway/internal/cache/exact"
+	"github.com/danger-baba/llm-inference-gateway/internal/cache/semantic"
 	"github.com/danger-baba/llm-inference-gateway/internal/providers"
 	"github.com/danger-baba/llm-inference-gateway/internal/ratelimit"
 	"github.com/danger-baba/llm-inference-gateway/internal/retry"
 	"github.com/danger-baba/llm-inference-gateway/internal/router"
 )
 
-// tokenCounter, rateLimiter, and exactCache are narrow interfaces so the
-// handler is testable without tiktoken-go or a live Redis; the concrete
-// tokenizer/ratelimit/cache/exact types satisfy them respectively.
+// tokenCounter, rateLimiter, exactCache, embedder, and semanticCache are
+// narrow interfaces so the handler is testable without tiktoken-go, a
+// live Redis, or a loaded ONNX model; the concrete
+// tokenizer/ratelimit/cache/exact/embedding/cache-semantic types satisfy
+// them respectively.
 type tokenCounter interface {
 	CountMessages(messages []providers.Message) int
 }
@@ -32,6 +35,15 @@ type rateLimiter interface {
 type exactCache interface {
 	Get(ctx context.Context, key string) (*providers.CanonicalResponse, bool, error)
 	Set(ctx context.Context, key string, resp *providers.CanonicalResponse) error
+}
+
+type embedder interface {
+	Embed(text string) ([]float32, error)
+}
+
+type semanticCache interface {
+	Get(q semantic.Query) (*providers.CanonicalResponse, float32, bool)
+	Set(q semantic.Query, resp *providers.CanonicalResponse)
 }
 
 // chatDeps is everything the chat completions handler needs to route and
@@ -47,6 +59,9 @@ type chatDeps struct {
 
 	cache                   exactCache // nil when cache.exact.enabled is false
 	cacheNonzeroTemperature bool
+
+	embedder      embedder      // nil when cache.semantic.enabled is false, or the model failed to load
+	semanticCache semanticCache // nil under the same conditions as embedder
 }
 
 const streamNotYetSupportedMsg = "streaming is not supported yet (lands in Phase 8); send stream:false or omit it"
@@ -111,21 +126,45 @@ func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 			return
 		}
 
+		cacheEligible := exact.Eligible(&req, deps.cacheNonzeroTemperature)
+
 		// Tier-1 cache: consulted only after a successful reservation, per
 		// the request lifecycle. A hit releases that reservation entirely,
 		// since no provider call is about to happen.
-		var cacheKey string
-		if deps.cache != nil && exact.Eligible(&req, deps.cacheNonzeroTemperature) {
+		var exactCacheKey string
+		if deps.cache != nil && cacheEligible {
 			if canon, err := exact.Canonicalize(&req); err == nil {
-				cacheKey = exact.Key(identity.OrgID.String(), canon)
-				if cached, hit, err := deps.cache.Get(r.Context(), cacheKey); err == nil && hit {
+				exactCacheKey = exact.Key(identity.OrgID.String(), canon)
+				if cached, hit, err := deps.cache.Get(r.Context(), exactCacheKey); err == nil && hit {
 					_ = deps.limiter.Adjust(r.Context(), scopes, cost)
-					w.Header().Set("X-Gateway-Cache", "exact")
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusOK)
-					_ = json.NewEncoder(w).Encode(cached)
+					writeCachedResponse(w, "exact", cached)
 					return
 				}
+			}
+		}
+
+		// Tier-2 cache: consulted only on a Tier-1 miss. A vector hit is
+		// rejected unless the non-semantic parameters (model, tools,
+		// response_format) also match exactly — similarity alone is
+		// insufficient (README, Tier-2 cache).
+		var semanticQuery semantic.Query
+		semanticEligible := deps.embedder != nil && deps.semanticCache != nil && cacheEligible
+		if semanticEligible {
+			toolsCanon, _ := exact.CanonicalizeJSON(req.Tools)
+			formatCanon, _ := exact.CanonicalizeJSON(req.ResponseFormat)
+			if vector, err := deps.embedder.Embed(concatUserTurns(req.Messages)); err == nil {
+				semanticQuery = semantic.Query{
+					TenantID: identity.OrgID.String(), Model: req.Model,
+					ToolsCanonical: string(toolsCanon), ResponseFormatCanonical: string(formatCanon),
+					Vector: vector,
+				}
+				if cached, _, hit := deps.semanticCache.Get(semanticQuery); hit {
+					_ = deps.limiter.Adjust(r.Context(), scopes, cost)
+					writeCachedResponse(w, "semantic", cached)
+					return
+				}
+			} else {
+				semanticEligible = false // embedding this request failed; don't try to Set() below either
 			}
 		}
 
@@ -151,12 +190,39 @@ func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 		// the wire, and never affects it: caching a completed response
 		// and reconciling its reservation are both settle-asynchronously
 		// concerns, not response-path ones.
-		if cacheKey != "" && deps.cache != nil {
-			_ = deps.cache.Set(r.Context(), cacheKey, result.Response)
+		if exactCacheKey != "" && deps.cache != nil {
+			_ = deps.cache.Set(r.Context(), exactCacheKey, result.Response)
+		}
+		if semanticEligible {
+			deps.semanticCache.Set(semanticQuery, result.Response)
 		}
 		actual := int64(result.Response.Usage.PromptTokens + result.Response.Usage.CompletionTokens)
 		_ = deps.limiter.Adjust(r.Context(), scopes, cost-actual)
 	}
+}
+
+// concatUserTurns embeds only the user's own words: system prompts and
+// prior assistant replies would pull the embedding toward whatever the
+// gateway or the model said, not what this particular question was about.
+func concatUserTurns(messages []providers.Message) string {
+	var b strings.Builder
+	for _, m := range messages {
+		if m.Role != "user" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(m.Content)
+	}
+	return b.String()
+}
+
+func writeCachedResponse(w http.ResponseWriter, tier string, resp *providers.CanonicalResponse) {
+	w.Header().Set("X-Gateway-Cache", tier)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func writeRateLimitRejection(w http.ResponseWriter, r *http.Request, d ratelimit.Decision) {

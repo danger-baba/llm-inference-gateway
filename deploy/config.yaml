@@ -1,6 +1,12 @@
 # Config for the gateway container in deploy/docker-compose.yml.
-# Sections below that no phase reads yet (semantic cache, batching) are
-# left empty/default; see docs/adr/0002.
+# Sections below that no phase reads yet (batching) are left empty/default;
+# see docs/adr/0002.
+#
+# cache.semantic's model/vocab/runtime paths are left unset here on purpose:
+# deploy/Dockerfile sets ONNXRUNTIME_LIB_PATH, EMBEDDING_MODEL_PATH, and
+# EMBEDDING_VOCAB_PATH as image environment variables pointing at the
+# assets it fetches at build time, which main.go's asset-path resolution
+# falls back to when these YAML fields are empty. See docs/adr/0012.
 #
 # The two mock providers below are deliberately set up to demonstrate
 # Phase 3's failover live: "primary" always returns 429, so every request
@@ -70,6 +76,14 @@ cache:
     enabled: true
     ttl: 1h
     cache_nonzero_temperature: false
+  semantic:
+    enabled: true
+    threshold: 0.89 # measured, see docs/eval/semantic_cache_eval.md and docs/adr/0012
+    embedding_model: all-MiniLM-L6-v2
+    hnsw: { m: 16, ef_construction: 200, ef_search: 64 }
+    max_vectors: 500000
+    ttl: 1h
+    persist_path: /data/semantic_cache.gob
 
 observability:
   log_level: info

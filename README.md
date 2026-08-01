@@ -26,7 +26,7 @@ piece already exists.
 | 4 | Auth, tenants, Postgres migrations | ✅ Done (admin API auth is a known gap — see Known Limitations) |
 | 5 | Token-aware rate limiter | ✅ Done |
 | 6 | Exact-match cache | ✅ Done |
-| 7 | Semantic cache | ⏳ Planned |
+| 7 | Semantic cache | ✅ Done |
 | 8 | Streaming (SSE) | ⏳ Planned |
 | 9 | Ledger, metrics, dashboards | ⏳ Planned |
 | 10 | Load tests and benchmarks | ⏳ Planned |
@@ -131,7 +131,7 @@ time so provider latency cancels out.
 | Metric | Value |
 |---|---|
 | Exact-match hit rate | _tbd_ |
-| Semantic hit rate (threshold 0.95) | _tbd_ |
+| Semantic hit rate (threshold 0.89) | _tbd_ |
 | Combined hit rate | _tbd_ |
 | Tokens avoided | _tbd_ |
 | Mean latency, cache hit vs miss | _tbd_ |
@@ -372,11 +372,15 @@ The expensive tier, consulted only on a Tier-1 miss.
   parameters are `M` (graph degree), `efConstruction` (build-time candidate breadth), and
   `efSearch` (query-time breadth). `efSearch` is the recall/latency dial and is the one to
   tune under load.
-- **Threshold.** Cosine similarity **≥ 0.95** to count as a hit. This is deliberately
-  conservative. A threshold that is too permissive returns confidently wrong answers to
-  questions nobody asked, which is a far worse failure than a cache miss; too strict simply
-  costs money. Start high, lower only if measured hit rates justify it, and never tune this
-  without an eval set.
+- **Threshold.** Cosine similarity **≥ 0.89** to count as a hit. This is deliberately
+  conservative, and it is a measured number, not a guess: a 20-pair eval set
+  (`docs/eval/semantic_cache_eval.md`, reproduced by
+  `internal/embedding/eval_test.go`) showed that all-MiniLM-L6-v2 puts true paraphrases of a
+  short chat question in the 0.75–0.93 cosine range, while the closest topically-adjacent
+  but genuinely different pair we tried (a poem vs. a story about the ocean) scored 0.887.
+  0.89 sits above that one, at the cost of missing some looser paraphrases — the intended
+  trade, since a wrong cache hit is a far worse failure than a cache miss. See docs/adr/0012
+  before changing it.
 - **Guard rail.** Vector similarity alone is not sufficient. A candidate hit is rejected
   unless the non-semantic parameters also match exactly — same model, same tool
   definitions, same `response_format`. A 0.97 cosine match against a request that asked for
@@ -685,7 +689,7 @@ cache:
     cache_nonzero_temperature: false
   semantic:
     enabled: true
-    threshold: 0.95
+    threshold: 0.89 # measured, see docs/eval/semantic_cache_eval.md and docs/adr/0012
     embedding_model: all-MiniLM-L6-v2
     hnsw: { m: 16, ef_construction: 200, ef_search: 64 }
     max_vectors: 500000
@@ -739,10 +743,12 @@ RPS where Go-based alternatives stay in the low single digits on the same hardwa
 goroutine-per-request model with a shared connection pool fits a proxy workload almost
 exactly, and `context` gives uniform cancellation for free.
 
-**Semantic caching at 0.95, not 0.85.** The failure mode of an over-permissive semantic
+**Semantic caching at 0.89, not 0.85.** The failure mode of an over-permissive semantic
 cache is returning a confident answer to a question the user did not ask, which is
 undetectable to them and corrosive to trust. The failure mode of an over-strict one is a
-slightly larger bill. Those are not symmetric, so the threshold starts conservative.
+slightly larger bill. Those are not symmetric, so the threshold starts conservative — and,
+per the build plan's own rule, was only moved off an arbitrary starting point (0.95) after
+measuring against a real eval set. See docs/adr/0012 and docs/eval/semantic_cache_eval.md.
 
 **Tokens, not requests, as the limiting unit.** Request-count limits cannot bound spend when
 per-request cost varies by three orders of magnitude. The cost of this choice is having to
@@ -856,8 +862,11 @@ README can do.
    independently, so the first failures after a provider degrades are paid N times.
 2. **Rate limits are eventually consistent under Redis partition.** The Lua script is atomic
    against a single Redis, but a partitioned cluster can briefly over-admit.
-3. **Semantic cache recall is only as good as the embedding model.** A small local model
-   trades recall for latency. Domain-specific phrasing may under-match.
+3. **Semantic cache recall is only as good as the embedding model, and this is measured, not
+   assumed.** A 20-pair eval (`docs/eval/semantic_cache_eval.md`) found all-MiniLM-L6-v2 puts
+   real chat-question paraphrases at 0.75–0.93 cosine similarity — meaning the threshold
+   (0.89) catches the closer paraphrases and misses looser ones by design, trading recall
+   for the precision the README argues for. See `docs/adr/0012`.
 4. **Completion-token estimation is a heuristic.** Absent `max_tokens`, the configured
    default can over-reserve and needlessly throttle a tenant.
 5. **No prompt-injection or PII filtering yet.** Real gateways in this space treat both as
@@ -880,6 +889,19 @@ README can do.
     provider outages currently can't finish starting up fully air-gapped. See `docs/adr/0009`.
 12. **A TPM limit changed in Postgres takes up to 5 minutes to take effect**, the same
     staleness window as every other identity field cached at `vk:{sha256}`.
+13. **The semantic cache's tenant isolation is a post-filter over one shared HNSW graph, not
+    one graph per tenant.** Correct, but every search does some wasted work scanning
+    candidates that belong to other tenants before discarding them. Fine at moderate tenant
+    counts; revisit if tenant cardinality grows large. See `docs/adr/0012`.
+14. **The semantic cache's memory can run up to ~2x `max_vectors`.** Evicting the oldest
+    entry doesn't delete it from the HNSW graph (a real upstream bug in `coder/hnsw` — see
+    `docs/adr/0012`), so orphaned vectors accumulate until a periodic full rebuild discards
+    them.
+15. **The semantic cache's assets (ONNX Runtime shared library, MiniLM model, vocab) must be
+    present on disk before startup**, fetched at Docker build time or via
+    `make download-embedding-model` for local runs — there is no first-run network fetch at
+    startup the way the tokenizer has. If they're missing, the gateway logs a warning and
+    runs with Tier-2 disabled rather than failing to start.
 
 ## Roadmap
 

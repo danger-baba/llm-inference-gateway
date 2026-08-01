@@ -212,9 +212,14 @@ func (c ExactCacheConfig) validate() []error {
 }
 
 type HNSWConfig struct {
-	M              int `yaml:"m"`
+	M        int `yaml:"m"`
+	EfSearch int `yaml:"ef_search"`
+
+	// EfConstruction is accepted and validated because the README's
+	// example config lists it, but coder/hnsw's Graph type has no
+	// build-time candidate-list-size knob distinct from EfSearch to pass
+	// it to. Kept rather than silently dropped. See docs/adr/0012.
 	EfConstruction int `yaml:"ef_construction"`
-	EfSearch       int `yaml:"ef_search"`
 }
 
 type SemanticCacheConfig struct {
@@ -224,6 +229,40 @@ type SemanticCacheConfig struct {
 	HNSW           HNSWConfig `yaml:"hnsw"`
 	MaxVectors     int        `yaml:"max_vectors"`
 	TTL            Duration   `yaml:"ttl"`
+
+	// The four fields below aren't in the README's example config: running
+	// all-MiniLM-L6-v2 locally via ONNX Runtime needs concrete file paths
+	// the README's single "embedding_model: all-MiniLM-L6-v2" name doesn't
+	// carry. See docs/adr/0012. All four fall back to environment
+	// variables of the same name (upper-cased) if left empty in YAML, and
+	// PersistPath falls back to a default under the working directory.
+	ONNXRuntimeLibPath string `yaml:"onnxruntime_lib_path"`
+	ModelPath          string `yaml:"model_path"`
+	VocabPath          string `yaml:"vocab_path"`
+	PersistPath        string `yaml:"persist_path"`
+}
+
+func (c SemanticCacheConfig) validate() []error {
+	if !c.Enabled {
+		return nil
+	}
+	var errs []error
+	if c.Threshold <= 0 || c.Threshold > 1 {
+		errs = append(errs, errors.New("cache.semantic.threshold: must be in (0, 1]"))
+	}
+	if c.MaxVectors <= 0 {
+		errs = append(errs, errors.New("cache.semantic.max_vectors: must be > 0 when cache.semantic.enabled is true"))
+	}
+	if c.TTL.Std() <= 0 {
+		errs = append(errs, errors.New("cache.semantic.ttl: must be > 0 when cache.semantic.enabled is true"))
+	}
+	if c.HNSW.M <= 0 {
+		errs = append(errs, errors.New("cache.semantic.hnsw.m: must be > 0 when cache.semantic.enabled is true"))
+	}
+	if c.HNSW.EfSearch <= 0 {
+		errs = append(errs, errors.New("cache.semantic.hnsw.ef_search: must be > 0 when cache.semantic.enabled is true"))
+	}
+	return errs
 }
 
 type CacheConfig struct {
@@ -232,7 +271,7 @@ type CacheConfig struct {
 }
 
 func (c CacheConfig) validate() []error {
-	return c.Exact.validate()
+	return append(c.Exact.validate(), c.Semantic.validate()...)
 }
 
 type RateLimitConfig struct {

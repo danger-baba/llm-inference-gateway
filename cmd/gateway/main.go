@@ -16,7 +16,9 @@ import (
 	"github.com/danger-baba/llm-inference-gateway/internal/auth"
 	"github.com/danger-baba/llm-inference-gateway/internal/breaker"
 	"github.com/danger-baba/llm-inference-gateway/internal/cache/exact"
+	"github.com/danger-baba/llm-inference-gateway/internal/cache/semantic"
 	"github.com/danger-baba/llm-inference-gateway/internal/config"
+	"github.com/danger-baba/llm-inference-gateway/internal/embedding"
 	"github.com/danger-baba/llm-inference-gateway/internal/ratelimit"
 	"github.com/danger-baba/llm-inference-gateway/internal/retry"
 	"github.com/danger-baba/llm-inference-gateway/internal/router"
@@ -98,6 +100,16 @@ func run() error {
 		exactCache = exact.NewStore(redisClient, cfg.Cache.Exact.TTL.Std())
 	}
 
+	embedder, semanticStore := buildSemanticCache(cfg, logger)
+	if semanticStore != nil {
+		if err := semanticStore.LoadFromDisk(semanticPersistPath(cfg)); err != nil {
+			logger.Warn("semantic cache: failed to load persisted index; starting empty", "error", err)
+		}
+	}
+	if embedder != nil {
+		defer embedder.Close()
+	}
+
 	srv, err := server.New(server.Options{
 		Addr:                     cfg.Server.Addr,
 		ReadTimeout:              cfg.Server.ReadTimeout.Std(),
@@ -117,6 +129,8 @@ func run() error {
 		EstimateCompletionTokens: int64(cfg.RateLimit.EstimateCompletionTokens),
 		ExactCache:               exactCache,
 		CacheNonzeroTemperature:  cfg.Cache.Exact.CacheNonzeroTemperature,
+		Embedder:                 embedder,
+		SemanticCache:            semanticStore,
 	})
 	if err != nil {
 		return err
@@ -130,10 +144,75 @@ func run() error {
 	prober := breaker.NewProber(breakerRegistry, providerSet, cfg.Breaker.ProberInterval.Std(), 5*time.Second)
 	go prober.Run(ctx)
 
-	if err := srv.Run(ctx); err != nil {
-		return fmt.Errorf("main: server: %w", err)
+	runErr := srv.Run(ctx)
+
+	// Persist the semantic index on the way out, per the README's
+	// concurrency model ("persist the HNSW index" as part of graceful
+	// shutdown) — after Run returns, so it happens after in-flight
+	// requests have already drained rather than racing them.
+	if semanticStore != nil {
+		if err := semanticStore.SaveToDisk(semanticPersistPath(cfg)); err != nil {
+			logger.Warn("semantic cache: failed to persist index on shutdown", "error", err)
+		}
+	}
+
+	if runErr != nil {
+		return fmt.Errorf("main: server: %w", runErr)
 	}
 	return nil
+}
+
+// buildSemanticCache wires up the embedder and HNSW store together, since
+// one is useless without the other. Any failure to load the embedding
+// model disables the whole tier and returns (nil, nil) rather than
+// failing startup — the README's stated failure mode ("disable this tier
+// and continue with Tier-1").
+func buildSemanticCache(cfg *config.Config, logger *slog.Logger) (*embedding.Embedder, *semantic.Store) {
+	if !cfg.Cache.Semantic.Enabled {
+		return nil, nil
+	}
+
+	libPath := resolveAssetPath(cfg.Cache.Semantic.ONNXRuntimeLibPath, "ONNXRUNTIME_LIB_PATH", "")
+	modelPath := resolveAssetPath(cfg.Cache.Semantic.ModelPath, "EMBEDDING_MODEL_PATH", "")
+	vocabPath := resolveAssetPath(cfg.Cache.Semantic.VocabPath, "EMBEDDING_VOCAB_PATH", "")
+
+	embedder, err := embedding.NewEmbedder(libPath, modelPath, vocabPath)
+	if err != nil {
+		logger.Warn("semantic cache: embedding model failed to load; Tier-2 disabled, continuing with Tier-1 only", "error", err)
+		return nil, nil
+	}
+
+	store := semantic.NewStore(
+		cfg.Cache.Semantic.HNSW.M,
+		cfg.Cache.Semantic.HNSW.EfSearch,
+		cfg.Cache.Semantic.MaxVectors,
+		float32(cfg.Cache.Semantic.Threshold),
+		cfg.Cache.Semantic.TTL.Std(),
+	)
+	return embedder, store
+}
+
+func semanticPersistPath(cfg *config.Config) string {
+	if cfg.Cache.Semantic.PersistPath != "" {
+		return cfg.Cache.Semantic.PersistPath
+	}
+	if v := os.Getenv("SEMANTIC_CACHE_PERSIST_PATH"); v != "" {
+		return v
+	}
+	return "semantic_cache.gob"
+}
+
+// resolveAssetPath prefers an explicit config value, then an environment
+// variable, then a default (which may itself be empty, since
+// embedding.NewEmbedder's own error is what actually surfaces a missing path).
+func resolveAssetPath(configValue, envVar, def string) string {
+	if configValue != "" {
+		return configValue
+	}
+	if v := os.Getenv(envVar); v != "" {
+		return v
+	}
+	return def
 }
 
 func newLogger(level string) *slog.Logger {

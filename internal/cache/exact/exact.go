@@ -45,11 +45,11 @@ type canonicalFields struct {
 // level, not just the top one — so two requests differing only in field
 // order produce byte-identical canonical output.
 func Canonicalize(req *providers.CanonicalRequest) ([]byte, error) {
-	responseFormat, err := canonicalizeJSON(req.ResponseFormat)
+	responseFormat, err := CanonicalizeJSON(req.ResponseFormat)
 	if err != nil {
 		return nil, fmt.Errorf("exact: canonicalize response_format: %w", err)
 	}
-	tools, err := canonicalizeJSON(req.Tools)
+	tools, err := CanonicalizeJSON(req.Tools)
 	if err != nil {
 		return nil, fmt.Errorf("exact: canonicalize tools: %w", err)
 	}
@@ -68,7 +68,12 @@ func Canonicalize(req *providers.CanonicalRequest) ([]byte, error) {
 	return json.Marshal(fields)
 }
 
-func canonicalizeJSON(raw json.RawMessage) (json.RawMessage, error) {
+// CanonicalizeJSON sorts an arbitrary JSON value's object keys recursively
+// (round-tripping through interface{} relies on encoding/json always
+// sorting map[string]interface{} keys on Marshal). Exported because the
+// semantic cache's guard rail needs the same canonical form for tools and
+// response_format that the exact cache's key already uses.
+func CanonicalizeJSON(raw json.RawMessage) (json.RawMessage, error) {
 	if len(raw) == 0 {
 		return nil, nil
 	}

@@ -25,6 +25,23 @@ jobs:
         with:
           go-version: "1.24"
 
+      - name: cache embedding assets
+        id: embedding-cache
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: embedding-assets-onnxruntime-1.28.0-minilm
+
+      - name: fetch embedding assets (ONNX Runtime + all-MiniLM-L6-v2)
+        if: steps.embedding-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .cache/minilm
+          curl -sL -o .cache/minilm/model.onnx "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx"
+          curl -sL -o .cache/minilm/vocab.txt "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/vocab.txt"
+          curl -sL -o /tmp/ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-1.28.0.tgz"
+          mkdir -p .cache/onnxruntime-linux-x64-1.28.0
+          tar -xzf /tmp/ort.tgz -C .cache/onnxruntime-linux-x64-1.28.0 --strip-components=1
+
       - name: build
         run: go build ./...
 
@@ -35,6 +52,9 @@ jobs:
         run: go test ./... -race
         env:
           RATELIMIT_TEST_REDIS_ADDR: localhost:6379
+          ONNXRUNTIME_LIB_PATH: ${{ github.workspace }}/.cache/onnxruntime-linux-x64-1.28.0/lib/libonnxruntime.so
+          EMBEDDING_MODEL_PATH: ${{ github.workspace }}/.cache/minilm/model.onnx
+          EMBEDDING_VOCAB_PATH: ${{ github.workspace }}/.cache/minilm/vocab.txt
 
       - name: lint
         uses: golangci/golangci-lint-action@v6
