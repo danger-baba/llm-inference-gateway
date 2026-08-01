@@ -1,0 +1,92 @@
+# Config for loadtest/overhead.js and loadtest/cache.js: a single always-
+# healthy "mock1" provider with a fixed 200ms latency, so gateway overhead
+# is separable from provider latency (README, Load testing). Use
+# deploy/config.yaml itself (not this file) for loadtest/failover.js --
+# it already sets up a primary-always-429/secondary-succeeds scenario.
+#
+# Postgres is intentionally left pointing at nothing reachable
+# (POSTGRES_DSN is set to a syntactically-valid but unreachable address
+# when running this): pgxpool connects lazily, and every auth lookup this
+# load test performs hits the Redis cache a one-time seed step
+# pre-populates (make loadtest-seed-key), so Postgres is never actually
+# queried on the request path. The ledger's async batch inserts fail and
+# get dropped exactly per their designed failure mode -- see
+# docs/adr/0014 -- which doesn't affect the request path being measured.
+#
+# redis.addr assumes a real Redis reachable at localhost:6379; if you're
+# running the portable non-service Redis this session used instead, copy
+# this file and change the port.
+#
+# cache.semantic's onnxruntime/model/vocab paths are left unset here on
+# purpose, exactly like deploy/config.yaml -- set ONNXRUNTIME_LIB_PATH,
+# EMBEDDING_MODEL_PATH, EMBEDDING_VOCAB_PATH (see make download-embedding-model).
+
+server:
+  addr: "127.0.0.1:18080"
+  read_timeout: 30s
+  request_timeout: 30s
+  max_body_bytes: 1048576
+  shutdown_timeout: 5s
+
+redis:
+  addr: "localhost:6379"
+  db: 0
+  dial_timeout: 2s
+
+postgres:
+  dsn_env: POSTGRES_DSN
+  ping_timeout: 2s
+
+providers:
+  - name: mock1
+    type: mock
+    priority: 0
+    weight: 1
+    timeout: 5s
+    latency: 200ms
+    failure_rate: 0
+
+model_aliases:
+  fast:
+    mock1: mock-model-v1
+
+breaker:
+  error_rate_threshold: 0.5
+  min_requests: 20
+  window: 30s
+  cooldown: 10s
+  cooldown_max: 5m
+  half_open_probes: 3
+  prober_interval: 15s
+
+retry:
+  max_attempts_per_provider: 2
+  base_backoff: 200ms
+  max_backoff: 5s
+
+rate_limit:
+  default_tpm: 200000000 # generous: this load test measures proxy/cache behavior, not rate-limit rejection
+  estimate_completion_tokens: 512
+  fail_open: true
+
+cache:
+  exact:
+    enabled: true
+    ttl: 1h
+    cache_nonzero_temperature: false
+  semantic:
+    enabled: true
+    threshold: 0.89
+    embedding_model: all-MiniLM-L6-v2
+    hnsw: { m: 16, ef_construction: 200, ef_search: 64 }
+    max_vectors: 500000
+    ttl: 1h
+
+ledger:
+  buffer_size: 10000
+  batch_size: 200
+  flush_interval: 1s
+
+observability:
+  log_level: info
+  log_request_bodies: false

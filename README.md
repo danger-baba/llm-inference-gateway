@@ -29,7 +29,7 @@ piece already exists.
 | 7 | Semantic cache | ✅ Done |
 | 8 | Streaming (SSE) | ✅ Done |
 | 9 | Ledger, metrics, dashboards | ✅ Done (see Known Limitations for the Postgres-integration-testing gap) |
-| 10 | Load tests and benchmarks | ⏳ Planned |
+| 10 | Load tests and benchmarks | ✅ Done |
 | 11 | Publish polish | ⏳ Planned |
 
 Architecture decisions made along the way, including deviations from this
@@ -107,42 +107,68 @@ invalidation, and budget tracking. This gateway centralises them in one hop.
 
 ## Benchmarks
 
-> **These tables are unpopulated on purpose.** Fill them from your own `k6` runs using the
-> method below — see [Load testing](#load-testing). Numbers copied from somewhere else are
-> worse than no numbers.
+Measured by actually running `loadtest/overhead.js`, `loadtest/cache.js`, `loadtest/failover.js`,
+and `make chaos` against a real, running gateway (see [Load testing](#load-testing) for exactly
+how, including a real workaround for this dev environment having no live Postgres). Full
+methodology notes, three real bugs the load-test scripts themselves had until they were actually
+run, and what these numbers do and don't cover: `docs/adr/0015`.
 
-**Environment:** _record CPU, RAM, Go version, Redis version, whether providers are mocked._
+**Environment:** AMD Ryzen 5 3550H (4 cores / 8 threads), 5.9 GB RAM available to this
+environment, Windows 11 Home Single Language (64-bit), Go 1.26.5 toolchain (module targets
+`go 1.24.0`), Redis 8.8.0, k6 v2.1.0. Providers mocked throughout (`internal/providers/mock`);
+Postgres was not reachable (see `docs/adr/0015`) so auth resolved from a pre-seeded Redis cache
+entry and ledger writes failed and dropped exactly per their designed failure mode, without
+affecting any request.
 
 ### Proxy overhead
 
-Latency added by the gateway itself, measured against a mock provider with fixed response
-time so provider latency cancels out.
+Latency added by the gateway itself, measured against a mock provider with a fixed 200ms
+response time so provider latency cancels out. `gateway_proxy_overhead_seconds` numbers are
+read directly from the gateway's own `/metrics`, not derived from client-side timing.
 
 | Metric | Value |
 |---|---|
-| Sustained throughput (RPS) | _tbd_ |
-| p50 added latency | _tbd_ |
-| p95 added latency | _tbd_ |
-| p99 added latency | _tbd_ |
-| Memory at steady state | _tbd_ |
+| Sustained throughput (RPS) | 150 req/s peak arrival rate, 0% request failures at every ramp stage (7,988 requests total) |
+| p50 added latency | 1.00ms |
+| p95 added latency | 2.40ms |
+| p99 added latency | 4.01ms |
+| Memory at steady state | 103.6 MB working set / 126 MB private, under 20 concurrent VUs (includes the loaded ONNX Runtime + MiniLM model for semantic caching; a deployment with `cache.semantic.enabled: false` will use meaningfully less) |
+
+End-to-end latency (`gateway_request_duration_seconds`, gateway-measured) came out to p50=225ms,
+p95=247.5ms, p99=249.5ms against a fixed 200ms provider — measurably higher than k6's own precise
+client-side median of 202ms. That gap is a real, disclosed limitation of Prometheus histogram
+bucket interpolation for a distribution this narrow, not gateway overhead; see `docs/adr/0015`.
+Trust the proxy-overhead row above (its own distribution is wide enough relative to its bucket
+boundaries not to suffer the same distortion) and k6's own `http_req_duration` for total latency.
 
 ### Cache effectiveness
 
+Measured with 70% repeat traffic drawn from a 10-question pool (`loadtest/cache.js`), against
+the real semantic cache (ONNX Runtime + all-MiniLM-L6-v2, threshold 0.89), 1,201 total requests.
+
 | Metric | Value |
 |---|---|
-| Exact-match hit rate | _tbd_ |
-| Semantic hit rate (threshold 0.89) | _tbd_ |
-| Combined hit rate | _tbd_ |
-| Tokens avoided | _tbd_ |
-| Mean latency, cache hit vs miss | _tbd_ |
+| Exact-match hit rate | 835 / 1,201 = 69.5% |
+| Semantic hit rate (threshold 0.89) | 266 / 1,201 = 22.1% — see the note below on why this is higher than a naive intuition would predict |
+| Combined hit rate | 1,101 / 1,201 = 91.7% |
+| Tokens avoided | 66,703 |
+| Mean latency, cache hit vs miss | hit: ~2.3ms (median observed); miss: ~200-220ms (matches the fixed provider latency plus proxy overhead above) |
+
+The semantic hit rate is elevated because this script's "fresh, should-never-repeat" traffic is
+still built from a small bank of question templates for genuine reproducibility — and
+all-MiniLM-L6-v2 clusters short, structurally-similar sentences together regardless of subject,
+exactly the characteristic `docs/adr/0012`'s Phase 7 eval set already found (a poem vs. a story
+about the ocean scored 0.887). This is the same documented model characteristic surfacing again
+under load, not a new or contradicting finding.
 
 ### Failover
 
 | Scenario | Result |
 |---|---|
-| Primary returns 100% `429` | _tbd_ % requests still succeed |
-| Primary killed mid-run | _tbd_ ms to route around |
-| All providers down | Fails fast with `503`, no hang |
+| Primary returns 100% `429` | 100% of requests still succeeded (450/450), all confirmed served by `secondary` |
+| Primary's breaker trips, steady state | ~0ms extra routing cost once open — median observed latency (~22ms) matches secondary's own configured 20ms latency almost exactly, since an OPEN breaker skips primary with no network call at all |
+| Gateway process killed and restarted mid-run (`make chaos`) | Served a real request immediately before the kill and again immediately after the restart; startup-to-healthy measured at ~0.7s in isolation. See `docs/adr/0015` for why this substitutes for "primary killed" in an architecture where providers are in-process, not separate services |
+| All providers down | Fails fast with `503`, no hang — covered by `TestHandleChatCompletions_NoHealthyProviderReturns503`, not re-measured under load here |
 
 ---
 
@@ -811,7 +837,7 @@ Grafana is on `:3000` with the gateway dashboard preloaded.
 make test          # unit tests
 make test-race     # race detector
 make bench         # Go benchmarks
-make chaos         # kill providers mid-run, assert no lost requests
+make chaos         # kill and restart the gateway process mid-run, assert it recovers
 ```
 
 ## Load testing
@@ -819,15 +845,30 @@ make chaos         # kill providers mid-run, assert no lost requests
 Reproducible harness in `loadtest/`. Run against the **mock provider** so measurements
 isolate gateway overhead from provider latency.
 
+If you don't have Postgres running (a full `docker compose up` handles this for you), a
+virtual key needs to exist in Redis before any request will authenticate — `make mock-provider`
+points Postgres at an address that's syntactically valid but never queried (`pgxpool` connects
+lazily, and the seeded Redis cache entry means auth never falls back to it); see `docs/adr/0015`
+for exactly why this is safe for load testing specifically, not a general auth bypass.
+
 ```bash
-make mock-provider                     # fixed 200ms responses
+make loadtest-seed-key                 # one-time: seed a virtual key into Redis
+make mock-provider                     # separate terminal: fixed 200ms responses
 k6 run loadtest/overhead.js            # ramp to find sustainable RPS
 k6 run loadtest/cache.js               # 70% repeat traffic, measures hit rate
-k6 run loadtest/failover.js            # primary returns 429, assert success rate
+
+# failover.js targets deploy/config.yaml's primary-always-429/secondary-succeeds setup
+# instead of loadtest.config.yaml -- start the gateway against that config for this one:
+POSTGRES_DSN="postgres://fake:fake@127.0.0.1:1/fakedb" go run ./cmd/gateway --config deploy/config.yaml
+k6 run loadtest/failover.js
 ```
 
 `loadtest/overhead.js` ramps arrival rate and records `gateway_proxy_overhead_seconds`
 alongside k6's own latency, so the gateway's contribution is separable from total time.
+Restart the gateway fresh before running `overhead.js` — its histogram numbers are cumulative
+from process start, and an earlier draft of this harness genuinely got this wrong when a
+second script inherited a prior run's leftover counters (see `docs/adr/0015`). `cache.js`
+snapshots its own counters before and after, so it reports correctly either way.
 
 **Then fill in [Benchmarks](#benchmarks) with what you measured**, and record the hardware
 you measured it on. A benchmark without an environment is not a benchmark.
@@ -929,6 +970,15 @@ README can do.
 21. **`GET /admin/usage`'s query parameters and response shape are this project's own
     design**, not a literal reading of anything in the README — the README's entire spec for
     this endpoint is "ledger aggregates by scope and window." See `docs/adr/0014`.
+22. **The Benchmarks numbers were measured without a live Postgres**, using a syntactically
+    valid but unreachable DSN plus a Redis-seeded auth cache entry (`docs/adr/0015`) — a
+    legitimate use of `pgxpool`'s lazy connection and the auth cache's normal
+    check-before-Postgres order, not a security bypass of anything real. The ledger's actual
+    SQL (`internal/ledger`) has still not been exercised against a live database in this
+    environment.
+23. **`make chaos` verifies the gateway recovers from being killed and restarted mid-run, not
+    that no request is ever double-charged.** The latter needs reading back `usage_ledger`
+    rows, which needs the same live Postgres note 22 describes. See `docs/adr/0015`.
 
 ## Roadmap
 

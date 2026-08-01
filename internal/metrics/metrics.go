@@ -14,6 +14,22 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
+// latencyBuckets replaces client_golang's DefBuckets (tuned for generic
+// web requests, coarsest right around 100ms-250ms) for all three latency
+// histograms here. This is a real, load-test-driven correction, not a
+// guess: running loadtest/overhead.js against a mock provider with a
+// fixed 200ms latency showed DefBuckets' bucket_quantile-style linear
+// interpolation undershooting the true ~202ms median by 25ms+, because
+// the entire distribution sat inside DefBuckets' single (0.1s, 0.25s]
+// gap with no boundary in between. These buckets add resolution
+// specifically across the 25ms-750ms band where LLM gateway overhead and
+// end-to-end latency actually live, while still covering sub-millisecond
+// cache hits and multi-second slow completions. See docs/adr/0015.
+var latencyBuckets = []float64{
+	0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.25,
+	0.3, 0.4, 0.5, 0.75, 1, 2, 5, 10,
+}
+
 var (
 	RequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "gateway_requests_total",
@@ -30,13 +46,13 @@ var (
 	RequestDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "gateway_request_duration_seconds",
 		Help:    "End-to-end request latency as observed by the client.",
-		Buckets: prometheus.DefBuckets,
+		Buckets: latencyBuckets,
 	})
 
 	ProxyOverhead = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "gateway_proxy_overhead_seconds",
 		Help:    "Gateway-added latency, excluding time spent inside provider calls.",
-		Buckets: prometheus.DefBuckets,
+		Buckets: latencyBuckets,
 	})
 
 	// ProviderDuration is labelled by provider and model despite the
@@ -46,7 +62,7 @@ var (
 	ProviderDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "gateway_provider_duration_seconds",
 		Help:    "Upstream provider call latency, isolating provider-side blame.",
-		Buckets: prometheus.DefBuckets,
+		Buckets: latencyBuckets,
 	}, []string{"provider", "model"})
 
 	CacheHitsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
