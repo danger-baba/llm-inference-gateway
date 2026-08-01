@@ -5,7 +5,7 @@ A production-grade reverse proxy for large language model APIs, written in Go.
 One OpenAI-compatible endpoint in front of many providers, with health-aware routing,
 automatic failover, two-tier caching, and token-aware rate limiting.
 
-![Go](https://img.shields.io/badge/Go-1.22-00ADD8)
+![Go](https://img.shields.io/badge/Go-1.24-00ADD8)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Status](https://img.shields.io/badge/status-in%20progress-yellow)
 
@@ -768,7 +768,7 @@ the fleet grows large — noted in [Known limitations](#known-limitations).
 
 ## Getting started
 
-**Requirements:** Go 1.22+, Docker, Docker Compose.
+**Requirements:** Go 1.24+, Docker, Docker Compose.
 
 ```bash
 git clone https://github.com/danger-baba/llm-inference-gateway
