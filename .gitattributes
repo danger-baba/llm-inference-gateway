@@ -1,0 +1,8 @@
+# Force LF regardless of a contributor's local core.autocrlf. Without
+# this, a fresh clone on Windows with the common core.autocrlf=true
+# checks every .go file out with CRLF line endings, and `gofmt -l .`
+# reports every single file as needing reformatting -- not because the
+# code is wrong, but purely from the line-ending conversion. Found by
+# actually cloning this repo fresh and running the commands in
+# CONTRIBUTING.md, per the Phase 11 gate.
+* text=auto eol=lf
