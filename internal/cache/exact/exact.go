@@ -128,12 +128,21 @@ func (s *Store) Get(ctx context.Context, key string) (*providers.CanonicalRespon
 	return &resp, true, nil
 }
 
-func (s *Store) Set(ctx context.Context, key string, resp *providers.CanonicalResponse) error {
+// Set stores resp under key for s.ttl, or for ttlOverride when non-nil --
+// a per-request hint honored by the caller (README, per-request cache
+// TTL; docs/adr/0017). Callers never pass an override <= 0: that means
+// "don't cache this at all," which is the caller's job to check before
+// ever reaching Set.
+func (s *Store) Set(ctx context.Context, key string, resp *providers.CanonicalResponse, ttlOverride *time.Duration) error {
 	payload, err := json.Marshal(resp)
 	if err != nil {
 		return fmt.Errorf("exact: encode response: %w", err)
 	}
-	if err := s.client.Set(ctx, key, payload, s.ttl).Err(); err != nil {
+	ttl := s.ttl
+	if ttlOverride != nil {
+		ttl = *ttlOverride
+	}
+	if err := s.client.Set(ctx, key, payload, ttl).Err(); err != nil {
 		return fmt.Errorf("exact: set: %w", err)
 	}
 	return nil

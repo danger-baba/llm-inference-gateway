@@ -108,10 +108,19 @@ func (s *Store) Get(q Query) (*providers.CanonicalResponse, float32, bool) {
 
 // Set stores resp under vector with q's guard-rail fields, evicting the
 // least-recently-used entry if this insert pushes the store past
-// maxVectors.
-func (s *Store) Set(q Query, resp *providers.CanonicalResponse) {
+// maxVectors. It expires after s.ttl, or after ttlOverride when non-nil --
+// a per-request hint honored by the caller (README, per-request cache
+// TTL; docs/adr/0017). Callers never pass an override <= 0: that means
+// "don't cache this at all," which is the caller's job to check before
+// ever reaching Set.
+func (s *Store) Set(q Query, resp *providers.CanonicalResponse, ttlOverride *time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	ttl := s.ttl
+	if ttlOverride != nil {
+		ttl = *ttlOverride
+	}
 
 	key := uuid.NewString()
 	e := &entry{
@@ -121,7 +130,7 @@ func (s *Store) Set(q Query, resp *providers.CanonicalResponse) {
 		toolsCanonical:          q.ToolsCanonical,
 		responseFormatCanonical: q.ResponseFormatCanonical,
 		vector:                  q.Vector,
-		expiresAt:               time.Now().Add(s.ttl),
+		expiresAt:               time.Now().Add(ttl),
 	}
 	e.lruElem = s.lru.PushFront(key)
 	s.entries[key] = e

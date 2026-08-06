@@ -41,6 +41,9 @@ type Options struct {
 	// ExactCache is nil when cache.exact.enabled is false.
 	ExactCache              *exact.Store
 	CacheNonzeroTemperature bool
+	// CacheMaxClientTTL is config.CacheConfig.MaxClientTTL: zero disables
+	// the per-request cache_ttl hint entirely. See docs/adr/0017.
+	CacheMaxClientTTL time.Duration
 
 	// Embedder and SemanticCache are nil when cache.semantic.enabled is
 	// false, or when the embedding model failed to load — the README's
@@ -109,6 +112,7 @@ func New(opts Options) (*Server, error) {
 		estimateCompletionTokens: opts.EstimateCompletionTokens,
 		cache:                    cacheIface,
 		cacheNonzeroTemperature:  opts.CacheNonzeroTemperature,
+		cacheMaxClientTTL:        opts.CacheMaxClientTTL,
 		embedder:                 embedderIface,
 		semanticCache:            semanticIface,
 		ledger:                   ledgerIface,

@@ -116,6 +116,7 @@ func testIdentity() auth.Identity {
 type fakeExactCache struct {
 	data               map[string]*providers.CanonicalResponse
 	getCalls, setCalls int
+	lastSetTTLOverride *time.Duration
 }
 
 func newFakeExactCache() *fakeExactCache {
@@ -128,9 +129,10 @@ func (f *fakeExactCache) Get(_ context.Context, key string) (*providers.Canonica
 	return resp, ok, nil
 }
 
-func (f *fakeExactCache) Set(_ context.Context, key string, resp *providers.CanonicalResponse) error {
+func (f *fakeExactCache) Set(_ context.Context, key string, resp *providers.CanonicalResponse, ttlOverride *time.Duration) error {
 	f.setCalls++
 	f.data[key] = resp
+	f.lastSetTTLOverride = ttlOverride
 	return nil
 }
 
@@ -150,11 +152,12 @@ func (f *fakeEmbedder) Embed(_ string) ([]float32, error) {
 }
 
 type fakeSemanticCache struct {
-	hitResponse *providers.CanonicalResponse
-	hit         bool
-	getCalls    int
-	setCalls    int
-	lastSetResp *providers.CanonicalResponse
+	hitResponse        *providers.CanonicalResponse
+	hit                bool
+	getCalls           int
+	setCalls           int
+	lastSetResp        *providers.CanonicalResponse
+	lastSetTTLOverride *time.Duration
 }
 
 func (f *fakeSemanticCache) Get(_ semantic.Query) (*providers.CanonicalResponse, float32, bool) {
@@ -165,9 +168,10 @@ func (f *fakeSemanticCache) Get(_ semantic.Query) (*providers.CanonicalResponse,
 	return f.hitResponse, 0.97, true
 }
 
-func (f *fakeSemanticCache) Set(_ semantic.Query, resp *providers.CanonicalResponse) {
+func (f *fakeSemanticCache) Set(_ semantic.Query, resp *providers.CanonicalResponse, ttlOverride *time.Duration) {
 	f.setCalls++
 	f.lastSetResp = resp
+	f.lastSetTTLOverride = ttlOverride
 }
 
 type fakeLedger struct {
@@ -460,6 +464,101 @@ func TestHandleChatCompletions_NonzeroTemperatureNeverCached(t *testing.T) {
 	}
 	if cache.getCalls != 0 || cache.setCalls != 0 {
 		t.Errorf("cache Get/Set calls = %d/%d, want 0/0 (cache must not even be consulted)", cache.getCalls, cache.setCalls)
+	}
+}
+
+func TestHandleChatCompletions_CacheTTLOverride_AppliedWhenWithinCeiling(t *testing.T) {
+	deps := testDeps(t)
+	cache := newFakeExactCache()
+	deps.cache = cache
+	deps.cacheMaxClientTTL = time.Hour
+
+	body := `{"model":"fast","temperature":0,"messages":[{"role":"user","content":"hi"}],"cache_ttl":"10m"}`
+	rec := doChatRequest(t, deps, body)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Gateway-Cache-TTL"); got != "10m0s" {
+		t.Errorf("X-Gateway-Cache-TTL = %q, want %q", got, "10m0s")
+	}
+	if cache.lastSetTTLOverride == nil || *cache.lastSetTTLOverride != 10*time.Minute {
+		t.Errorf("cache Set() ttlOverride = %v, want a pointer to 10m", cache.lastSetTTLOverride)
+	}
+}
+
+func TestHandleChatCompletions_CacheTTLOverride_CappedByCeiling(t *testing.T) {
+	deps := testDeps(t)
+	cache := newFakeExactCache()
+	deps.cache = cache
+	deps.cacheMaxClientTTL = time.Hour
+
+	body := `{"model":"fast","temperature":0,"messages":[{"role":"user","content":"hi"}],"cache_ttl":"48h"}`
+	rec := doChatRequest(t, deps, body)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Gateway-Cache-TTL"); got != "1h0m0s" {
+		t.Errorf("X-Gateway-Cache-TTL = %q, want the operator's ceiling %q, not the client's 48h request", got, "1h0m0s")
+	}
+	if cache.lastSetTTLOverride == nil || *cache.lastSetTTLOverride != time.Hour {
+		t.Errorf("cache Set() ttlOverride = %v, want a pointer to the 1h ceiling", cache.lastSetTTLOverride)
+	}
+}
+
+func TestHandleChatCompletions_CacheTTLOverride_ZeroSkipsCachingEntirely(t *testing.T) {
+	deps := testDeps(t)
+	cache := newFakeExactCache()
+	deps.cache = cache
+	deps.cacheMaxClientTTL = time.Hour
+
+	body := `{"model":"fast","temperature":0,"messages":[{"role":"user","content":"hi"}],"cache_ttl":"-1s"}`
+	rec := doChatRequest(t, deps, body)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Gateway-Cache-TTL"); got != "0" {
+		t.Errorf("X-Gateway-Cache-TTL = %q, want %q", got, "0")
+	}
+	if cache.setCalls != 0 {
+		t.Errorf("cache Set() called %d times, want 0 (a non-positive cache_ttl opts out of caching entirely)", cache.setCalls)
+	}
+}
+
+func TestHandleChatCompletions_CacheTTLHint_IgnoredWhenFeatureDisabled(t *testing.T) {
+	deps := testDeps(t) // cacheMaxClientTTL left at its zero value: feature disabled
+	cache := newFakeExactCache()
+	deps.cache = cache
+
+	body := `{"model":"fast","temperature":0,"messages":[{"role":"user","content":"hi"}],"cache_ttl":"24h"}`
+	rec := doChatRequest(t, deps, body)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a client hint must never break a deployment that hasn't enabled it); body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Gateway-Cache-TTL"); got != "" {
+		t.Errorf("X-Gateway-Cache-TTL = %q, want no header when the feature is disabled", got)
+	}
+	if cache.setCalls != 1 {
+		t.Fatalf("cache Set() called %d times, want 1", cache.setCalls)
+	}
+	if cache.lastSetTTLOverride != nil {
+		t.Errorf("cache Set() ttlOverride = %v, want nil (ignored hint falls back to the store's own default)", cache.lastSetTTLOverride)
+	}
+}
+
+func TestHandleChatCompletions_CacheTTLHint_MalformedIsBadRequestWhenEnabled(t *testing.T) {
+	deps := testDeps(t)
+	deps.cache = newFakeExactCache()
+	deps.cacheMaxClientTTL = time.Hour
+
+	body := `{"model":"fast","messages":[{"role":"user","content":"hi"}],"cache_ttl":"not-a-duration"}`
+	rec := doChatRequest(t, deps, body)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
 	}
 }
 

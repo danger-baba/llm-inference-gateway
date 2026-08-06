@@ -84,6 +84,7 @@ cache:
     max_vectors: 500000
     ttl: 1h
     persist_path: /data/semantic_cache.gob
+  max_client_ttl: 24h # ceiling for a request's own cache_ttl hint; 0 disables it, see docs/adr/0017
 
 ledger:
   buffer_size: 10000

@@ -416,6 +416,17 @@ The expensive tier, consulted only on a Tier-1 miss.
 - **Eviction.** LRU over the vector store with a configured memory ceiling, plus the same
   TTL as Tier-1.
 
+#### Per-request TTL override (both tiers)
+
+A request can include `"cache_ttl": "<duration>"` (e.g. `"24h"`) to override that one
+entry's lifetime in whichever tier ends up storing it, instead of using the tier's own
+configured default. `cache.max_client_ttl` is the operator's ceiling: a request asking for
+longer is capped to it, never rejected. A zero-or-negative `cache_ttl` means "don't cache
+this response at all" and skips both tiers entirely. Leaving `cache.max_client_ttl` unset
+(the default) disables the whole feature — a client's `cache_ttl` is then accepted but has
+no effect. The applied value, if any, comes back on the `X-Gateway-Cache-TTL` response
+header. See docs/adr/0017.
+
 ### 6. Token-aware rate limiter
 
 Counting requests is the wrong unit. One request can cost a thousandth of another, so RPM
@@ -654,6 +665,8 @@ X-Request-Id:        uuid
 X-Gateway-Provider:  which provider actually served it
 X-Gateway-Cache:     none | exact | semantic
 X-Gateway-Attempts:  openai:429, anthropic:200
+X-Gateway-Cache-TTL: 1h0m0s | 0          (only when the request sent cache_ttl and
+                                          cache.max_client_ttl is configured; see docs/adr/0017)
 X-RateLimit-Scope:   org | team | key      (on 429)
 Retry-After:         seconds                (on 429)
 ```
@@ -722,6 +735,7 @@ cache:
     hnsw: { m: 16, ef_construction: 200, ef_search: 64 }
     max_vectors: 500000
     ttl: 1h
+  max_client_ttl: 24h # ceiling for a request's own cache_ttl hint; 0 (default) disables it, see docs/adr/0017
 
 rate_limit:
   default_tpm: 200000

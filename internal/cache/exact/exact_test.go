@@ -174,7 +174,7 @@ func TestStore_SetThenGet(t *testing.T) {
 	key := Key("test-tenant-"+t.Name(), []byte(`{"model":"fast"}`))
 
 	resp := &providers.CanonicalResponse{ID: "abc", Model: "fast", Choices: []providers.Choice{{Message: providers.Message{Role: "assistant", Content: "hi"}}}}
-	if err := store.Set(context.Background(), key, resp); err != nil {
+	if err := store.Set(context.Background(), key, resp, nil); err != nil {
 		t.Fatalf("Set() unexpected error: %v", err)
 	}
 
@@ -210,12 +210,12 @@ func TestStore_PurgeTenant(t *testing.T) {
 
 	for _, canon := range [][]byte{[]byte(`{"model":"a"}`), []byte(`{"model":"b"}`)} {
 		key := Key(tenant, canon)
-		if err := store.Set(context.Background(), key, &providers.CanonicalResponse{ID: "x"}); err != nil {
+		if err := store.Set(context.Background(), key, &providers.CanonicalResponse{ID: "x"}, nil); err != nil {
 			t.Fatalf("Set() unexpected error: %v", err)
 		}
 	}
 	otherKey := Key("other-tenant-"+t.Name(), []byte(`{"model":"a"}`))
-	if err := store.Set(context.Background(), otherKey, &providers.CanonicalResponse{ID: "y"}); err != nil {
+	if err := store.Set(context.Background(), otherKey, &providers.CanonicalResponse{ID: "y"}, nil); err != nil {
 		t.Fatalf("Set() unexpected error: %v", err)
 	}
 
@@ -232,5 +232,28 @@ func TestStore_PurgeTenant(t *testing.T) {
 	}
 	if _, hit, _ := store.Get(context.Background(), otherKey); !hit {
 		t.Error("PurgeTenant() deleted a key belonging to a different tenant")
+	}
+}
+
+// TestStore_SetTTLOverride confirms a non-nil override replaces the
+// store's own configured TTL, rather than merely being ignored, since
+// Redis's own TTL command is the only real way to observe what Set
+// actually sent to the server.
+func TestStore_SetTTLOverride(t *testing.T) {
+	client := testStoreClient(t)
+	store := NewStore(client, time.Hour) // configured default: 1h
+	key := Key("ttl-override-tenant-"+t.Name(), []byte(`{"model":"fast"}`))
+
+	override := 5 * time.Minute
+	if err := store.Set(context.Background(), key, &providers.CanonicalResponse{ID: "abc"}, &override); err != nil {
+		t.Fatalf("Set() unexpected error: %v", err)
+	}
+
+	ttl, err := client.TTL(context.Background(), key).Result()
+	if err != nil {
+		t.Fatalf("TTL() unexpected error: %v", err)
+	}
+	if ttl <= 0 || ttl > override {
+		t.Errorf("TTL() = %v, want a positive value <= override %v (store default was 1h)", ttl, override)
 	}
 }

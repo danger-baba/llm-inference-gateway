@@ -46,7 +46,7 @@ type rateLimiter interface {
 
 type exactCache interface {
 	Get(ctx context.Context, key string) (*providers.CanonicalResponse, bool, error)
-	Set(ctx context.Context, key string, resp *providers.CanonicalResponse) error
+	Set(ctx context.Context, key string, resp *providers.CanonicalResponse, ttlOverride *time.Duration) error
 }
 
 type embedder interface {
@@ -55,7 +55,7 @@ type embedder interface {
 
 type semanticCache interface {
 	Get(q semantic.Query) (*providers.CanonicalResponse, float32, bool)
-	Set(q semantic.Query, resp *providers.CanonicalResponse)
+	Set(q semantic.Query, resp *providers.CanonicalResponse, ttlOverride *time.Duration)
 }
 
 // ledgerRecorder is satisfied by *ledger.Writer; nil when Postgres isn't
@@ -78,6 +78,10 @@ type chatDeps struct {
 
 	cache                   exactCache // nil when cache.exact.enabled is false
 	cacheNonzeroTemperature bool
+	// cacheMaxClientTTL is config.CacheConfig.MaxClientTTL: zero disables
+	// the per-request cache_ttl hint entirely (docs/adr/0017), so a
+	// client-supplied value is accepted but has no effect.
+	cacheMaxClientTTL time.Duration
 
 	embedder      embedder      // nil when cache.semantic.enabled is false, or the model failed to load
 	semanticCache semanticCache // nil under the same conditions as embedder
@@ -104,6 +108,11 @@ func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 		}
 		if len(req.Messages) == 0 {
 			writeJSONError(w, r, http.StatusBadRequest, "messages must not be empty")
+			return
+		}
+		ttlOverride, err := resolveCacheTTLOverride(req.CacheTTL, deps.cacheMaxClientTTL)
+		if err != nil {
+			writeJSONError(w, r, http.StatusBadRequest, err.Error())
 			return
 		}
 		maybeLogPromptBody(r.Context(), deps, req.Messages)
@@ -150,7 +159,7 @@ func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 		}
 
 		if req.Stream {
-			handleStreamingChatCompletion(w, r, deps, &req, identity, tiers, cost, scopes, promptTokens, start)
+			handleStreamingChatCompletion(w, r, deps, &req, identity, tiers, cost, scopes, promptTokens, start, ttlOverride)
 			return
 		}
 
@@ -184,6 +193,9 @@ func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 		w.Header().Set("X-Gateway-Provider", result.Provider)
 		w.Header().Set("X-Gateway-Attempts", formatAttempts(result.Attempts))
 		w.Header().Set("X-Gateway-Cache", "none")
+		if ttlOverride != nil {
+			w.Header().Set("X-Gateway-Cache-TTL", formatCacheTTL(*ttlOverride))
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(result.Response)
@@ -192,7 +204,7 @@ func handleChatCompletions(deps chatDeps) http.HandlerFunc {
 		// the wire, and never affects it: caching a completed response
 		// and reconciling its reservation are both settle-asynchronously
 		// concerns, not response-path ones.
-		storeInCaches(r.Context(), deps, lookup, result.Response)
+		storeInCaches(r.Context(), deps, lookup, result.Response, ttlOverride)
 		actual := int64(result.Response.Usage.PromptTokens + result.Response.Usage.CompletionTokens)
 		_ = deps.limiter.Adjust(r.Context(), scopes, cost-actual)
 		recordSuccessObservability(r.Context(), deps, identity, result.Provider, result.Model,
@@ -257,14 +269,53 @@ func checkCaches(ctx context.Context, deps chatDeps, req *providers.CanonicalReq
 // storeInCaches populates whichever tiers checkCaches found this request
 // eligible for. Only called once resp is a genuinely complete response --
 // never for a partial stream (README, Tier-2 cache: "never cache a
-// partial stream").
-func storeInCaches(ctx context.Context, deps chatDeps, lookup cacheLookup, resp *providers.CanonicalResponse) {
+// partial stream"). ttlOverride is what resolveCacheTTLOverride computed
+// for this request; a value <= 0 means the client asked for this
+// response not to be cached at all (docs/adr/0017), so neither tier is
+// written.
+func storeInCaches(ctx context.Context, deps chatDeps, lookup cacheLookup, resp *providers.CanonicalResponse, ttlOverride *time.Duration) {
+	if ttlOverride != nil && *ttlOverride <= 0 {
+		return
+	}
 	if lookup.exactCacheKey != "" && deps.cache != nil {
-		_ = deps.cache.Set(ctx, lookup.exactCacheKey, resp)
+		_ = deps.cache.Set(ctx, lookup.exactCacheKey, resp, ttlOverride)
 	}
 	if lookup.semanticEligible {
-		deps.semanticCache.Set(lookup.semanticQuery, resp)
+		deps.semanticCache.Set(lookup.semanticQuery, resp, ttlOverride)
 	}
+}
+
+// resolveCacheTTLOverride parses a client's cache_ttl request hint (see
+// providers.CanonicalRequest.CacheTTL) into what should actually be
+// applied: nil means "no override -- use the tier's own configured TTL."
+// The hint is silently ignored, never an error, whenever the operator
+// hasn't opted into this feature (maxClientTTL <= 0, config.CacheConfig's
+// zero value) -- a client hint aimed at a deployment that never enabled
+// it shouldn't break requests to one that hasn't. A parsed value <= 0
+// means "don't cache this response at all"; a value over maxClientTTL is
+// capped to it, since the operator's ceiling always wins (docs/adr/0017).
+func resolveCacheTTLOverride(raw string, maxClientTTL time.Duration) (*time.Duration, error) {
+	if raw == "" || maxClientTTL <= 0 {
+		return nil, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid cache_ttl %q: %w", raw, err)
+	}
+	if d > maxClientTTL {
+		d = maxClientTTL
+	}
+	return &d, nil
+}
+
+// formatCacheTTL renders the applied TTL for X-Gateway-Cache-TTL: "0" for
+// "not cached at all," otherwise the duration's own String() form (e.g.
+// "24h0m0s"), matching the same unambiguous format the client sent.
+func formatCacheTTL(d time.Duration) string {
+	if d <= 0 {
+		return "0"
+	}
+	return d.String()
 }
 
 // concatUserTurns embeds only the user's own words: system prompts and

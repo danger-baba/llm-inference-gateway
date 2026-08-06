@@ -85,6 +85,7 @@ func handleStreamingChatCompletion(
 	w http.ResponseWriter, r *http.Request, deps chatDeps,
 	req *providers.CanonicalRequest, identity auth.Identity,
 	tiers []router.Tier, cost int64, scopes ratelimit.Scopes, promptTokens int, start time.Time,
+	ttlOverride *time.Duration,
 ) {
 	ctx := r.Context()
 
@@ -132,6 +133,9 @@ func handleStreamingChatCompletion(
 			w.Header().Set("X-Accel-Buffering", "no")
 			w.Header().Set("X-Gateway-Provider", providerName)
 			w.Header().Set("X-Gateway-Cache", "none")
+			if ttlOverride != nil {
+				w.Header().Set("X-Gateway-Cache-TTL", formatCacheTTL(*ttlOverride))
+			}
 			w.WriteHeader(http.StatusOK)
 			headersSent = true
 		}
@@ -183,7 +187,7 @@ func handleStreamingChatCompletion(
 		ID: id, Object: "chat.completion", Created: created, Model: req.Model,
 		Choices: []providers.Choice{{Index: 0, Message: providers.Message{Role: "assistant", Content: fullContent.String()}, FinishReason: finishReason}},
 		Usage:   *usage,
-	})
+	}, ttlOverride)
 }
 
 // handleStreamError reconciles the reservation and finishes the response

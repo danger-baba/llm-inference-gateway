@@ -31,7 +31,7 @@ func TestGet_MissOnEmptyStore(t *testing.T) {
 func TestSetThenGet_IdenticalVectorHits(t *testing.T) {
 	s := NewStore(16, 20, 100, 0.95, time.Hour)
 	q := testQuery([]float32{1, 0, 0})
-	s.Set(q, testResponse("abc"))
+	s.Set(q, testResponse("abc"), nil)
 
 	resp, sim, hit := s.Get(q)
 	if !hit {
@@ -47,7 +47,7 @@ func TestSetThenGet_IdenticalVectorHits(t *testing.T) {
 
 func TestGet_BelowThresholdMisses(t *testing.T) {
 	s := NewStore(16, 20, 100, 0.95, time.Hour)
-	s.Set(testQuery([]float32{1, 0, 0}), testResponse("abc"))
+	s.Set(testQuery([]float32{1, 0, 0}), testResponse("abc"), nil)
 
 	// Orthogonal vector: cosine similarity 0, far below the 0.95 threshold.
 	_, _, hit := s.Get(testQuery([]float32{0, 1, 0}))
@@ -60,7 +60,7 @@ func TestGet_GuardRailRejectsModelMismatch(t *testing.T) {
 	s := NewStore(16, 20, 100, 0.95, time.Hour)
 	stored := testQuery([]float32{1, 0, 0})
 	stored.Model = "fast"
-	s.Set(stored, testResponse("abc"))
+	s.Set(stored, testResponse("abc"), nil)
 
 	lookup := testQuery([]float32{1, 0, 0})
 	lookup.Model = "cheap" // same vector, different model
@@ -74,7 +74,7 @@ func TestGet_GuardRailRejectsResponseFormatMismatch(t *testing.T) {
 	s := NewStore(16, 20, 100, 0.95, time.Hour)
 	stored := testQuery([]float32{1, 0, 0})
 	stored.ResponseFormatCanonical = `{"type":"text"}`
-	s.Set(stored, testResponse("abc"))
+	s.Set(stored, testResponse("abc"), nil)
 
 	lookup := testQuery([]float32{1, 0, 0})
 	lookup.ResponseFormatCanonical = `{"type":"json_object"}`
@@ -88,7 +88,7 @@ func TestGet_GuardRailRejectsToolsMismatch(t *testing.T) {
 	s := NewStore(16, 20, 100, 0.95, time.Hour)
 	stored := testQuery([]float32{1, 0, 0})
 	stored.ToolsCanonical = `[{"name":"a"}]`
-	s.Set(stored, testResponse("abc"))
+	s.Set(stored, testResponse("abc"), nil)
 
 	lookup := testQuery([]float32{1, 0, 0})
 	lookup.ToolsCanonical = `[{"name":"b"}]`
@@ -102,7 +102,7 @@ func TestGet_TenantIsolation(t *testing.T) {
 	s := NewStore(16, 20, 100, 0.95, time.Hour)
 	stored := testQuery([]float32{1, 0, 0})
 	stored.TenantID = "tenant-a"
-	s.Set(stored, testResponse("abc"))
+	s.Set(stored, testResponse("abc"), nil)
 
 	lookup := testQuery([]float32{1, 0, 0})
 	lookup.TenantID = "tenant-b"
@@ -115,7 +115,7 @@ func TestGet_TenantIsolation(t *testing.T) {
 func TestGet_ExpiredEntryNotServed(t *testing.T) {
 	s := NewStore(16, 20, 100, 0.95, time.Millisecond)
 	q := testQuery([]float32{1, 0, 0})
-	s.Set(q, testResponse("abc"))
+	s.Set(q, testResponse("abc"), nil)
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -130,15 +130,15 @@ func TestSet_LRUEvictionAtCapacity(t *testing.T) {
 
 	first := testQuery([]float32{1, 0, 0})
 	first.Model = "first"
-	s.Set(first, testResponse("first"))
+	s.Set(first, testResponse("first"), nil)
 
 	second := testQuery([]float32{0, 1, 0})
 	second.Model = "second"
-	s.Set(second, testResponse("second"))
+	s.Set(second, testResponse("second"), nil)
 
 	third := testQuery([]float32{0, 0, 1})
 	third.Model = "third"
-	s.Set(third, testResponse("third")) // should evict "first" (least recently used)
+	s.Set(third, testResponse("third"), nil) // should evict "first" (least recently used)
 
 	if s.Len() != 2 {
 		t.Fatalf("Len() = %d, want 2", s.Len())
@@ -156,18 +156,18 @@ func TestSet_GetTouchesLRUOrder(t *testing.T) {
 
 	a := testQuery([]float32{1, 0, 0})
 	a.Model = "a"
-	s.Set(a, testResponse("a"))
+	s.Set(a, testResponse("a"), nil)
 
 	b := testQuery([]float32{0, 1, 0})
 	b.Model = "b"
-	s.Set(b, testResponse("b"))
+	s.Set(b, testResponse("b"), nil)
 
 	// Touch "a" so "b" becomes the least-recently-used one instead.
 	s.Get(a)
 
 	c := testQuery([]float32{0, 0, 1})
 	c.Model = "c"
-	s.Set(c, testResponse("c")) // should evict "b", not "a"
+	s.Set(c, testResponse("c"), nil) // should evict "b", not "a"
 
 	if _, _, hit := s.Get(a); !hit {
 		t.Error("\"a\" was recently touched and should not have been evicted")
@@ -186,7 +186,7 @@ func TestSet_HeavyEvictionChurnDoesNotCrash(t *testing.T) {
 
 	for i := 0; i < 500; i++ {
 		q := testQuery([]float32{float32(i), float32(i + 1), float32(i + 2)})
-		s.Set(q, testResponse("x"))
+		s.Set(q, testResponse("x"), nil)
 		// Also exercise Get on every iteration, since that's what
 		// actually calls the buggy Search path.
 		s.Get(testQuery([]float32{1, 2, 3}))
@@ -197,13 +197,39 @@ func TestSet_HeavyEvictionChurnDoesNotCrash(t *testing.T) {
 	}
 }
 
+// TestSet_TTLOverride confirms a non-nil override replaces the store's
+// own configured TTL for that one entry, in both directions: a shorter
+// override expires sooner than the store default would, and other
+// entries stored without an override keep using that default.
+func TestSet_TTLOverride(t *testing.T) {
+	s := NewStore(16, 20, 100, 0.95, time.Hour) // configured default: 1h
+
+	short := time.Millisecond
+	overridden := testQuery([]float32{1, 0, 0})
+	overridden.Model = "overridden"
+	s.Set(overridden, testResponse("short-lived"), &short)
+
+	usesDefault := testQuery([]float32{0, 1, 0})
+	usesDefault.Model = "default"
+	s.Set(usesDefault, testResponse("long-lived"), nil)
+
+	time.Sleep(10 * time.Millisecond)
+
+	if _, _, hit := s.Get(overridden); hit {
+		t.Error("Get() hit = true, want false (the overridden TTL should have already expired)")
+	}
+	if _, _, hit := s.Get(usesDefault); !hit {
+		t.Error("Get() hit = false, want true (this entry used the store's 1h default, not the override)")
+	}
+}
+
 func TestSaveLoad_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "semantic.gob")
 
 	original := NewStore(16, 20, 100, 0.95, time.Hour)
 	q := testQuery([]float32{1, 0, 0})
-	original.Set(q, testResponse("abc"))
+	original.Set(q, testResponse("abc"), nil)
 
 	if err := original.SaveToDisk(path); err != nil {
 		t.Fatalf("SaveToDisk() unexpected error: %v", err)
@@ -236,7 +262,7 @@ func TestSaveLoad_ExpiredEntriesAreDropped(t *testing.T) {
 
 	original := NewStore(16, 20, 100, 0.95, time.Millisecond)
 	q := testQuery([]float32{1, 0, 0})
-	original.Set(q, testResponse("abc"))
+	original.Set(q, testResponse("abc"), nil)
 	time.Sleep(10 * time.Millisecond)
 
 	if err := original.SaveToDisk(path); err != nil {

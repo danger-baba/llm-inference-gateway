@@ -137,6 +137,7 @@ func run() error {
 		EstimateCompletionTokens: int64(cfg.RateLimit.EstimateCompletionTokens),
 		ExactCache:               exactCache,
 		CacheNonzeroTemperature:  cfg.Cache.Exact.CacheNonzeroTemperature,
+		CacheMaxClientTTL:        cfg.Cache.MaxClientTTL.Std(),
 		Embedder:                 embedder,
 		SemanticCache:            semanticStore,
 		Ledger:                   ledgerWriter,

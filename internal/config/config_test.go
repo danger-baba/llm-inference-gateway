@@ -308,6 +308,55 @@ cache:
 	}
 }
 
+func TestValidate_MaxClientTTLRule(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{
+			name: "negative max_client_ttl",
+			yaml: minimalValidConfig + `
+cache:
+  max_client_ttl: -1h
+`,
+			wantErr: "cache.max_client_ttl",
+		},
+		{
+			name: "positive max_client_ttl is fine",
+			yaml: minimalValidConfig + `
+cache:
+  max_client_ttl: 24h
+`,
+			wantErr: "",
+		},
+		{
+			name:    "zero (the default) is fine -- it just disables the feature",
+			yaml:    minimalValidConfig,
+			wantErr: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeTemp(t, tt.yaml)
+			_, err := Load(path)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Load() unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Load() expected error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Load() error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidate_SemanticCacheRules(t *testing.T) {
 	tests := []struct {
 		name    string

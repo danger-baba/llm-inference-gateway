@@ -31,6 +31,14 @@ type CanonicalRequest struct {
 	Tools          json.RawMessage `json:"tools,omitempty"`
 	Stream         bool            `json:"stream,omitempty"`
 	User           string          `json:"user,omitempty"`
+
+	// CacheTTL is a gateway-only extension, never sent to a provider: an
+	// optional client hint for how long a fresh answer to this request
+	// should be remembered, as a Go duration string (e.g. "24h"). A
+	// zero-or-negative duration means "don't cache this response at
+	// all." The operator has final say — see
+	// config.CacheConfig.MaxClientTTL and docs/adr/0017.
+	CacheTTL string `json:"cache_ttl,omitempty"`
 }
 
 type Choice struct {

@@ -268,10 +268,24 @@ func (c SemanticCacheConfig) validate() []error {
 type CacheConfig struct {
 	Exact    ExactCacheConfig    `yaml:"exact"`
 	Semantic SemanticCacheConfig `yaml:"semantic"`
+
+	// MaxClientTTL bounds how long a client's own cache_ttl request hint
+	// (see providers.CanonicalRequest.CacheTTL) can extend a cached
+	// entry's lifetime. Zero (the default) disables the feature
+	// entirely: a client-supplied hint is accepted but has no effect,
+	// and every entry uses its tier's own configured TTL as before. See
+	// docs/adr/0017.
+	MaxClientTTL Duration `yaml:"max_client_ttl"`
 }
 
 func (c CacheConfig) validate() []error {
-	return append(c.Exact.validate(), c.Semantic.validate()...)
+	var errs []error
+	if c.MaxClientTTL.Std() < 0 {
+		errs = append(errs, errors.New("cache.max_client_ttl: must be >= 0"))
+	}
+	errs = append(errs, c.Exact.validate()...)
+	errs = append(errs, c.Semantic.validate()...)
+	return errs
 }
 
 type RateLimitConfig struct {
